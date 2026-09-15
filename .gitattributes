@@ -1,0 +1,12 @@
+# Keep LF in the repository. gradlew and the iOS build scripts fail with a
+# "bad interpreter" error if they are checked out with CRLF.
+* text=auto eol=lf
+
+*.bat text eol=crlf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.tflite binary
+*.jar binary
+*.keystore binary

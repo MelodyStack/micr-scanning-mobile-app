@@ -1,0 +1,53 @@
+// Mirrors for Google's Maven, declared first.
+//
+// dl.google.com is unreliable from this network -- it has resolved to a
+// non-Google address (220.181.174.161) and intermittently fails with "No such
+// host", which killed the build partway through configuring third-party
+// modules. Gradle tries repositories in order and moves on when one fails, so
+// listing a reachable mirror first makes the build deterministic instead of
+// dependent on whether DNS happens to work that minute.
+//
+// Everything here is a read-only mirror of the same artefacts. If you build
+// somewhere with clean access to dl.google.com, deleting this block changes
+// nothing except where the bytes come from.
+def googleMirrors = { rh ->
+    rh.maven { url = "https://maven.aliyun.com/repository/google" }
+    rh.maven { url = "https://maven.aliyun.com/repository/public" }
+    rh.maven { url = "https://maven.aliyun.com/repository/gradle-plugin" }
+    rh.google()
+    rh.mavenCentral()
+}
+
+buildscript {
+    ext {
+        buildToolsVersion = "37.0.0"
+        minSdkVersion = 24
+        compileSdkVersion = 37
+        targetSdkVersion = 36
+        ndkVersion = "27.1.12297006"
+        kotlinVersion = "2.2.0"
+    }
+    repositories {
+        maven { url = "https://maven.aliyun.com/repository/google" }
+        maven { url = "https://maven.aliyun.com/repository/public" }
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath("com.android.tools.build:gradle")
+        classpath("com.facebook.react:react-native-gradle-plugin")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin")
+    }
+}
+
+// Autolinked native modules (vision-camera, fast-tflite, nitro-modules, ...)
+// each carry their own buildscript block, so the mirrors have to be applied
+// across every project rather than just this one.
+allprojects {
+    buildscript {
+        repositories { googleMirrors(delegate) }
+    }
+    repositories { googleMirrors(delegate) }
+}
+
+apply plugin: "com.facebook.react.rootproject"
