@@ -8,6 +8,7 @@ import {
   locateBandRows,
   findMicrBand,
   mirrorImage,
+  findDocumentRect,
   cropGlyph,
   GrayImage,
 } from '../src/micr/segment';
@@ -327,5 +328,71 @@ describe('finding the band in a whole cheque', () => {
       }
     }
     expect(findMicrBand({ data, width, height })).toBeNull();
+  });
+});
+
+describe('cheque photographed on a dark surface', () => {
+  /**
+   * The situation from the device: a bright cheque occupying the middle of a
+   * frame, surrounded by a dark desk. Otsu over the whole frame splits desk
+   * from paper, so without cropping to the sheet first every dark background
+   * row reads as solid ink and the band search finds nothing.
+   */
+  function chequeOnDesk(): GrayImage {
+    const width = 960;
+    const height = 720;
+    const data = new Uint8Array(width * height).fill(58); // dark desk
+
+    const px = 70;
+    const py = 150;
+    const pw = 820;
+    const ph = 420;
+    for (let y = py; y < py + ph; y++) {
+      data.fill(230, y * width + px, y * width + px + pw); // paper
+    }
+
+    const block = (x0: number, y0: number, w: number, h: number) => {
+      for (let y = y0; y < y0 + h; y++) {
+        data.fill(35, y * width + x0, y * width + x0 + w);
+      }
+    };
+    // Printed lines on the cheque.
+    for (let i = 0; i < 5; i++) {
+      block(140 + i * 90, 210, 46 + (i % 3) * 20, 15);
+    }
+    for (let i = 0; i < 4; i++) {
+      block(160 + i * 140, 330, 96, 18);
+    }
+    // The MICR line, fixed pitch, near the bottom of the paper.
+    for (let i = 0; i < 32; i++) {
+      block(130 + i * 23, 500, 12, 28);
+    }
+    return { data, width, height };
+  }
+
+  it('crops to the sheet and excludes the desk', () => {
+    const rect = findDocumentRect(chequeOnDesk());
+    expect(rect.x0).toBeGreaterThan(40);
+    expect(rect.x1).toBeLessThan(940);
+    expect(rect.y0).toBeGreaterThan(120);
+    expect(rect.y1).toBeLessThan(600);
+  });
+
+  it('finds the MICR line despite the dark background', () => {
+    const found = findMicrBand(chequeOnDesk());
+    expect(found).not.toBeNull();
+    expect(found!.boxes).toHaveLength(32);
+  });
+
+  it('falls back to the whole frame when there is no distinct sheet', () => {
+    // Uniform image: nothing to crop to, so it must not crop to a sliver.
+    const width = 300;
+    const height = 200;
+    const rect = findDocumentRect({
+      data: new Uint8Array(width * height).fill(200),
+      width,
+      height,
+    });
+    expect(rect).toEqual({ x0: 0, y0: 0, x1: width, y1: height });
   });
 });

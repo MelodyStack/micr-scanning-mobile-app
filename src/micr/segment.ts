@@ -164,6 +164,83 @@ export function cropRows(image: GrayImage, top: number, bottom: number): GrayIma
   };
 }
 
+export interface Rect {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+/**
+ * Find the sheet of paper in the frame and return its bounds.
+ *
+ * This has to happen before anything looks for text. A photo of a cheque is
+ * mostly desk, and Otsu over the whole frame splits *background from paper*,
+ * not *ink from paper* -- so every dark pixel of the desk counts as ink, the
+ * rows above and below the cheque come out solid, and they merge into one run
+ * far too tall to be a line of text. Every candidate is then discarded and the
+ * search reports nothing, on a frame where the band is perfectly visible.
+ *
+ * Cropping to the paper first makes the second threshold mean what the rest of
+ * the pipeline assumes it means. This is find_document from the Python
+ * segmenter, by brightness profile rather than contours -- a cheque is a
+ * bright rectangle on a darker surface, which is all the signal needed.
+ */
+export function findDocumentRect(image: GrayImage): Rect {
+  const threshold = otsuThreshold(image);
+  const { width, height, data } = image;
+
+  const colBright = new Int32Array(width);
+  const rowBright = new Int32Array(height);
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    for (let x = 0; x < width; x++) {
+      if (data[row + x] > threshold) {
+        colBright[x]++;
+        rowBright[y]++;
+      }
+    }
+  }
+
+  // A row or column belongs to the sheet if a good part of it is paper-bright.
+  const span = (counts: Int32Array, extent: number) => {
+    let peak = 0;
+    for (let i = 0; i < counts.length; i++) {
+      peak = Math.max(peak, counts[i]);
+    }
+    if (peak === 0) {
+      return { lo: 0, hi: counts.length };
+    }
+    const cutoff = peak * 0.35;
+    let lo = 0;
+    let hi = counts.length - 1;
+    while (lo < counts.length && counts[lo] < cutoff) {
+      lo++;
+    }
+    while (hi > lo && counts[hi] < cutoff) {
+      hi--;
+    }
+    // A sliver is not a sheet; fall back to the whole frame rather than
+    // cropping to noise.
+    return hi - lo < extent * 0.2 ? { lo: 0, hi: counts.length } : { lo, hi: hi + 1 };
+  };
+
+  const cols = span(colBright, width);
+  const rows = span(rowBright, height);
+  return { x0: cols.lo, y0: rows.lo, x1: cols.hi, y1: rows.hi };
+}
+
+export function cropRect(image: GrayImage, rect: Rect): GrayImage {
+  const width = Math.max(1, rect.x1 - rect.x0);
+  const height = Math.max(1, rect.y1 - rect.y0);
+  const out = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    const src = (rect.y0 + y) * image.width + rect.x0;
+    out.set(image.data.subarray(src, src + width), y * width);
+  }
+  return { data: out, width, height };
+}
+
 /**
  * Every horizontal strip in the image that might be a line of text.
  *
@@ -275,11 +352,15 @@ export interface BandFind {
  * in recognizeDocument instead.
  */
 export function findMicrBand(image: GrayImage): BandFind | null {
-  let best: BandFind | null = null;
-  const coarse = otsuThreshold(image);
+  // Crop to the sheet first, so the threshold that follows separates ink from
+  // paper rather than paper from desk.
+  const paper = cropRect(image, findDocumentRect(image));
 
-  for (const rows of findBandCandidates(image, coarse)) {
-    const band = cropRows(image, rows.top, rows.bottom);
+  let best: BandFind | null = null;
+  const coarse = otsuThreshold(paper);
+
+  for (const rows of findBandCandidates(paper, coarse)) {
+    const band = cropRows(paper, rows.top, rows.bottom);
     const boxes = findGlyphBoxes(band, otsuThreshold(band));
     const quality = bandQuality(boxes);
     if (quality > 0 && (!best || quality > best.quality)) {
