@@ -92,13 +92,22 @@ export default function ScanScreen() {
   // Shared with the camera thread: a ref is not visible from a worklet, so
   // without this the processor would pile up frames faster than they are read.
   const busyShared = useSharedValue(false);
-  const orientationShared = useSharedValue(0);
+  // Primitives, not an index into a module-level array. A worklet only sees
+  // values captured into its closure; reaching for a module object from inside
+  // one leaves it undefined, and the resulting throw was being swallowed by the
+  // catch below -- the processor span forever without ever calling onBand, so
+  // the readout simply went blank.
+  const rotationShared = useSharedValue<'0deg' | '90deg' | '180deg' | '270deg'>('0deg');
+  const mirrorShared = useSharedValue(false);
+  const modeIndex = useRef(0);
 
   const cycleOrientation = useCallback(() => {
-    const next = (orientationShared.value + 1) % ORIENTATIONS.length;
-    orientationShared.value = next;
+    modeIndex.current = (modeIndex.current + 1) % ORIENTATIONS.length;
+    const next = ORIENTATIONS[modeIndex.current];
+    rotationShared.value = next.rotation;
+    mirrorShared.value = next.mirror;
     voter.current.reset();
-  }, [orientationShared]);
+  }, [rotationShared, mirrorShared]);
   // Same reason in reverse -- the worklet closure would capture a stale status.
   const statusRef = useRef<Status>('loading');
   useEffect(() => {
@@ -166,7 +175,8 @@ export default function ScanScreen() {
       height: number,
       fw: number,
       fh: number,
-      mode: number,
+      rotation: string,
+      mirror: boolean,
     ) => {
       if (!model || statusRef.current !== 'scanning') {
         busy.current = false;
@@ -174,9 +184,8 @@ export default function ScanScreen() {
       }
       try {
         const result = recognizeBand(model, { data: grey, width, height });
-        const o = ORIENTATIONS[mode];
         setDebug(
-          `${fw}x${fh} · ${o.rotation}${o.mirror ? ' mirrored' : ''} · ` +
+          `${fw}x${fh} · ${rotation}${mirror ? ' mirrored' : ''} · ` +
             `glyphs ${result.glyphCount}` +
             (result.raw ? `\n${result.raw}` : ''),
         );
@@ -204,6 +213,10 @@ export default function ScanScreen() {
     [model],
   );
 
+  const onWorkletError = useRunOnJS((message: string) => {
+    setDebug(`frame processor error: ${message}`);
+  }, []);
+
   const frameProcessor = useFrameProcessor(
     frame => {
       'worklet';
@@ -224,8 +237,9 @@ export default function ScanScreen() {
         // centre-crops the frame to fill the screen: the visible area is a
         // sub-rectangle, and GUIDE is a fraction of *that*, not of the whole
         // frame. Ignoring the cover crop sampled a strip well above the band.
-        const mode = ORIENTATIONS[orientationShared.value];
-        const quarterTurn = mode.rotation === '90deg' || mode.rotation === '270deg';
+        const rotation = rotationShared.value;
+        const mirror = mirrorShared.value;
+        const quarterTurn = rotation === '90deg' || rotation === '270deg';
         // A quarter turn swaps the axes, so the output aspect flips with it.
         const srcW = quarterTurn ? frame.height : frame.width;
         const srcH = quarterTurn ? frame.width : frame.height;
@@ -235,7 +249,7 @@ export default function ScanScreen() {
 
         const full = resize(frame, {
           scale: { width: workW, height: workH },
-          rotation: mode.rotation,
+          rotation,
           pixelFormat: 'rgb',
           dataType: 'uint8',
         });
@@ -265,19 +279,26 @@ export default function ScanScreen() {
           let src = ((y0 + y) * workW + x0) * 3;
           const rowStart = y * bandW;
           for (let x = 0; x < bandW; x++, src += 3) {
-            const dst = rowStart + (mode.mirror ? bandW - 1 - x : x);
+            const dst = rowStart + (mirror ? bandW - 1 - x : x);
             grey[dst] = (full[src] * 77 + full[src + 1] * 150 + full[src + 2] * 29) >> 8;
           }
         }
 
-        onBand(grey, bandW, bandH, srcW, srcH, orientationShared.value).then(() => {
+        onBand(grey, bandW, bandH, srcW, srcH, rotation, mirror).then(() => {
           busyShared.value = false;
         });
-      } catch {
+      } catch (e: any) {
+        // Never swallow this. A silent catch here already hid one bug for a
+        // whole round: the processor threw on every frame, reset itself, and
+        // looked exactly like a camera that was simply not seeing anything.
+        onWorkletError(String(e?.message ?? e));
         busyShared.value = false;
       }
     },
-    [onBand, resize, busyShared, screenW, screenH],
+    [
+      onBand, onWorkletError, resize, busyShared,
+      screenW, screenH, rotationShared, mirrorShared,
+    ],
   );
 
   const reset = useCallback(() => {
