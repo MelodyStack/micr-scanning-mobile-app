@@ -42,6 +42,31 @@ import ScanOverlay, { GUIDE } from '../components/ScanOverlay';
  */
 const WORK_WIDTH = 960;
 
+/**
+ * How the sensor frame has to be turned to match what the preview draws.
+ *
+ * Sensor mounting differs by device, so the same code can come out upright on
+ * one phone and mirrored or upside down on another. A mirrored frame is the
+ * nastiest of those: the glyphs still segment, the model still classifies, and
+ * the line assembles backwards -- so it fails the checksum with no hint as to
+ * why. Tapping the preview cycles these, and the readout shows which is
+ * active, so the right one can be found on the device in a few seconds rather
+ * than guessed at from here.
+ */
+export const ORIENTATIONS: {
+  rotation: '0deg' | '90deg' | '180deg' | '270deg';
+  mirror: boolean;
+}[] = [
+  { rotation: '0deg', mirror: false },
+  { rotation: '0deg', mirror: true },
+  { rotation: '90deg', mirror: false },
+  { rotation: '90deg', mirror: true },
+  { rotation: '180deg', mirror: false },
+  { rotation: '180deg', mirror: true },
+  { rotation: '270deg', mirror: false },
+  { rotation: '270deg', mirror: true },
+];
+
 type Status = 'loading' | 'scanning' | 'done' | 'error';
 
 export default function ScanScreen() {
@@ -67,6 +92,13 @@ export default function ScanScreen() {
   // Shared with the camera thread: a ref is not visible from a worklet, so
   // without this the processor would pile up frames faster than they are read.
   const busyShared = useSharedValue(false);
+  const orientationShared = useSharedValue(0);
+
+  const cycleOrientation = useCallback(() => {
+    const next = (orientationShared.value + 1) % ORIENTATIONS.length;
+    orientationShared.value = next;
+    voter.current.reset();
+  }, [orientationShared]);
   // Same reason in reverse -- the worklet closure would capture a stale status.
   const statusRef = useRef<Status>('loading');
   useEffect(() => {
@@ -128,15 +160,25 @@ export default function ScanScreen() {
    * through the whole pipeline, and the same functions the unit tests cover.
    */
   const onBand = useRunOnJS(
-    (grey: Uint8Array, width: number, height: number, fw: number, fh: number) => {
+    (
+      grey: Uint8Array,
+      width: number,
+      height: number,
+      fw: number,
+      fh: number,
+      mode: number,
+    ) => {
       if (!model || statusRef.current !== 'scanning') {
         busy.current = false;
         return;
       }
       try {
         const result = recognizeBand(model, { data: grey, width, height });
+        const o = ORIENTATIONS[mode];
         setDebug(
-          `frame ${fw}x${fh} → band ${width}x${height} · glyphs ${result.glyphCount}`,
+          `${fw}x${fh} · ${o.rotation}${o.mirror ? ' mirrored' : ''} · ` +
+            `glyphs ${result.glyphCount}` +
+            (result.raw ? `\n${result.raw}` : ''),
         );
 
         if (!result.ok) {
@@ -182,16 +224,18 @@ export default function ScanScreen() {
         // centre-crops the frame to fill the screen: the visible area is a
         // sub-rectangle, and GUIDE is a fraction of *that*, not of the whole
         // frame. Ignoring the cover crop sampled a strip well above the band.
-        const portraitFrame = frame.height > frame.width;
-        const srcW = portraitFrame ? frame.height : frame.width;
-        const srcH = portraitFrame ? frame.width : frame.height;
+        const mode = ORIENTATIONS[orientationShared.value];
+        const quarterTurn = mode.rotation === '90deg' || mode.rotation === '270deg';
+        // A quarter turn swaps the axes, so the output aspect flips with it.
+        const srcW = quarterTurn ? frame.height : frame.width;
+        const srcH = quarterTurn ? frame.width : frame.height;
 
         const workW = WORK_WIDTH;
         const workH = Math.max(2, Math.round((workW * srcH) / srcW));
 
         const full = resize(frame, {
           scale: { width: workW, height: workH },
-          rotation: portraitFrame ? '90deg' : '0deg',
+          rotation: mode.rotation,
           pixelFormat: 'rgb',
           dataType: 'uint8',
         });
@@ -214,16 +258,19 @@ export default function ScanScreen() {
         }
 
         // Crop and convert to luminance in one pass (ITU-R 601 weights).
+        // Un-mirroring here rather than on the pixels afterwards costs nothing:
+        // the destination index simply walks backwards along each row.
         const grey = new Uint8Array(bandW * bandH);
         for (let y = 0; y < bandH; y++) {
           let src = ((y0 + y) * workW + x0) * 3;
-          let dst = y * bandW;
-          for (let x = 0; x < bandW; x++, src += 3, dst++) {
+          const rowStart = y * bandW;
+          for (let x = 0; x < bandW; x++, src += 3) {
+            const dst = rowStart + (mode.mirror ? bandW - 1 - x : x);
             grey[dst] = (full[src] * 77 + full[src + 1] * 150 + full[src + 2] * 29) >> 8;
           }
         }
 
-        onBand(grey, bandW, bandH, srcW, srcH).then(() => {
+        onBand(grey, bandW, bandH, srcW, srcH, orientationShared.value).then(() => {
           busyShared.value = false;
         });
       } catch {
@@ -295,12 +342,21 @@ export default function ScanScreen() {
           active={status === 'scanning'}
           debug={__DEV__ ? debug : ''}
         />
+        {/* Tap anywhere to try the next sensor orientation. Sits under the
+            result sheet so it cannot swallow those buttons. */}
+        {status === 'scanning' && (
+          <Pressable
+            style={StyleSheet.absoluteFill}
+            onPress={cycleOrientation}
+            accessibilityLabel="Change camera orientation"
+          />
+        )}
         {fields && <ResultCard fields={fields} onRescan={reset} />}
       </>
     );
   }, [
     device, error, fields, frameProcessor, hasPermission, hint,
-    requestPermission, reset, status,
+    requestPermission, reset, status, cycleOrientation, debug,
   ]);
 
   return <View style={styles.root}>{body}</View>;
