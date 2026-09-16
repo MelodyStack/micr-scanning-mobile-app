@@ -164,6 +164,131 @@ export function cropRows(image: GrayImage, top: number, bottom: number): GrayIma
   };
 }
 
+/**
+ * Every horizontal strip in the image that might be a line of text.
+ *
+ * Rows carrying ink are grouped into runs, with small vertical gaps bridged so
+ * the dot of a glyph does not split a line in two. Anything too thin to be
+ * print or tall enough to be a block of handwriting is dropped. The caller
+ * scores what survives.
+ *
+ * This is band_candidates from the offline Python segmenter. Ink alone is a
+ * weak signal -- a signature or a printed caption carries more of it than the
+ * MICR line -- so candidates are ranked later by how well they actually parse
+ * as E-13B, not by how dark they are.
+ */
+export function findBandCandidates(
+  image: GrayImage,
+  threshold: number,
+  options: { maxCandidates?: number } = {},
+): { top: number; bottom: number }[] {
+  const maxCandidates = options.maxCandidates ?? 10;
+
+  const rowInk = new Int32Array(image.height);
+  for (let y = 0; y < image.height; y++) {
+    const row = y * image.width;
+    let count = 0;
+    for (let x = 0; x < image.width; x++) {
+      if (image.data[row + x] <= threshold) {
+        count++;
+      }
+    }
+    rowInk[y] = count;
+  }
+
+  // A row counts as "inked" if a small fraction of it is dark. Too high and a
+  // sparse line of digits is missed; too low and paper texture joins up.
+  const minInk = Math.max(3, Math.round(image.width * 0.01));
+  const bridge = Math.max(1, Math.round(image.height * 0.006));
+
+  const runs: { top: number; bottom: number; ink: number }[] = [];
+  let start = -1;
+  let gap = 0;
+  let ink = 0;
+  for (let y = 0; y <= image.height; y++) {
+    const inked = y < image.height && rowInk[y] >= minInk;
+    if (inked) {
+      if (start < 0) {
+        start = y;
+        ink = 0;
+      }
+      gap = 0;
+      ink += rowInk[y];
+    } else if (start >= 0) {
+      gap++;
+      if (gap > bridge || y === image.height) {
+        runs.push({ top: start, bottom: y - gap + 1, ink });
+        start = -1;
+      }
+    }
+  }
+
+  const minHeight = Math.max(4, Math.round(image.height * 0.012));
+  const maxHeight = Math.round(image.height * 0.22);
+  return runs
+    .filter(r => {
+      const h = r.bottom - r.top;
+      return h >= minHeight && h <= maxHeight;
+    })
+    .sort((a, b) => b.ink - a.ink)
+    .slice(0, maxCandidates)
+    .map(r => {
+      const pad = Math.max(2, Math.round((r.bottom - r.top) * 0.2));
+      return {
+        top: Math.max(0, r.top - pad),
+        bottom: Math.min(image.height, r.bottom + pad),
+      };
+    });
+}
+
+/** Horizontally mirror an image. Used to undo a flipped sensor. */
+export function mirrorImage(image: GrayImage): GrayImage {
+  const out = new Uint8Array(image.data.length);
+  for (let y = 0; y < image.height; y++) {
+    const row = y * image.width;
+    for (let x = 0; x < image.width; x++) {
+      out[row + x] = image.data[row + image.width - 1 - x];
+    }
+  }
+  return { data: out, width: image.width, height: image.height };
+}
+
+export interface BandFind {
+  band: GrayImage;
+  boxes: GlyphBox[];
+  quality: number;
+  rows: { top: number; bottom: number };
+  mirrored: boolean;
+}
+
+/**
+ * Search a whole cheque image for the MICR line.
+ *
+ * Every candidate strip is segmented and scored, and the best-parsing one
+ * wins. That is what makes this robust to where the cheque sits in frame: no
+ * alignment, no guide box, no mapping between preview and sensor coordinates.
+ *
+ * Mirroring is deliberately NOT considered here. A mirrored band segments
+ * exactly as well as an upright one -- same glyph count, same pitch, same
+ * widths -- so no amount of geometry tells the two apart. Only classifying the
+ * glyphs and checking the ABA digit does, which is why the mirror retry lives
+ * in recognizeDocument instead.
+ */
+export function findMicrBand(image: GrayImage): BandFind | null {
+  let best: BandFind | null = null;
+  const coarse = otsuThreshold(image);
+
+  for (const rows of findBandCandidates(image, coarse)) {
+    const band = cropRows(image, rows.top, rows.bottom);
+    const boxes = findGlyphBoxes(band, otsuThreshold(band));
+    const quality = bandQuality(boxes);
+    if (quality > 0 && (!best || quality > best.quality)) {
+      best = { band, boxes, quality, rows, mirrored: false };
+    }
+  }
+  return best;
+}
+
 export interface SegmentOptions {
   /** Centre hops below this fraction of a run's width are inside one glyph. */
   pitchMinFrac?: number;

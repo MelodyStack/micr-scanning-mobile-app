@@ -6,6 +6,8 @@ import {
   bandQuality,
   cropRows,
   locateBandRows,
+  findMicrBand,
+  mirrorImage,
   cropGlyph,
   GrayImage,
 } from '../src/micr/segment';
@@ -249,5 +251,81 @@ describe('band row localisation', () => {
     const data = new Uint8Array(width * height).fill(20);
     const boxes = findGlyphBoxes({ data, width, height }, 128);
     expect(boxes.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe('finding the band in a whole cheque', () => {
+  /**
+   * A cheque-like image: printed text near the top, a long handwritten-ish
+   * scrawl in the middle, and a fixed-pitch MICR line near the bottom.
+   */
+  function cheque(micrGlyphs = 32): GrayImage {
+    const width = 960;
+    const height = 436; // 2.2:1
+    const data = new Uint8Array(width * height).fill(232);
+
+    const block = (x0: number, y0: number, w: number, h: number, v = 40) => {
+      for (let y = y0; y < y0 + h; y++) {
+        for (let x = x0; x < x0 + w; x++) {
+          data[y * width + x] = v;
+        }
+      }
+    };
+
+    // Payee / bank lines: irregular word-like blobs.
+    for (let i = 0; i < 6; i++) {
+      block(80 + i * 70, 60, 34 + (i % 3) * 18, 14);
+    }
+    for (let i = 0; i < 4; i++) {
+      block(120 + i * 130, 150, 90 + (i % 2) * 40, 20);
+    }
+    // A long signature stroke -- lots of ink, no fixed pitch.
+    for (let x = 520; x < 900; x++) {
+      const y = 250 + Math.round(18 * Math.sin(x / 26));
+      block(x, y, 2, 4, 20);
+    }
+
+    // The MICR line: constant pitch near the bottom.
+    const pitch = 24;
+    const startX = 90;
+    for (let i = 0; i < micrGlyphs; i++) {
+      block(startX + i * pitch, 370, 13, 30, 25);
+    }
+    return { data, width, height };
+  }
+
+  it('locates the MICR line rather than the signature or the text', () => {
+    const img = cheque(32);
+    const found = findMicrBand(img);
+    expect(found).not.toBeNull();
+    expect(found!.boxes).toHaveLength(32);
+    // It must have chosen the strip near the bottom, not the lines above.
+    expect(found!.rows.top).toBeGreaterThan(300);
+  });
+
+  it('segments a mirrored frame just as well, which is why geometry cannot detect the flip', () => {
+    // A mirrored band has the same glyph count, pitch and widths as an upright
+    // one, so the search cannot tell them apart and must not pretend to. Only
+    // classifying the glyphs and checking the ABA digit distinguishes them,
+    // which is what recognizeDocument retries on.
+    const found = findMicrBand(mirrorImage(cheque(32)));
+    expect(found).not.toBeNull();
+    expect(found!.boxes).toHaveLength(32);
+    expect(found!.mirrored).toBe(false);
+  });
+
+  it('returns null when there is no MICR line in view', () => {
+    const width = 400;
+    const height = 300;
+    const data = new Uint8Array(width * height).fill(230);
+    // Scattered blobs, nothing on a regular pitch.
+    for (let i = 0; i < 5; i++) {
+      for (let y = 40 + i * 40; y < 55 + i * 40; y++) {
+        for (let x = 30 + i * 61; x < 30 + i * 61 + 25; x++) {
+          data[y * width + x] = 30;
+        }
+      }
+    }
+    expect(findMicrBand({ data, width, height })).toBeNull();
   });
 });

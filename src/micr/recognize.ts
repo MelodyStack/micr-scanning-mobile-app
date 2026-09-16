@@ -17,6 +17,9 @@ import {
   cropGlyph,
   cropRows,
   findGlyphBoxes,
+  findMicrBand,
+  GlyphBox,
+  mirrorImage,
   GrayImage,
   locateBandRows,
   otsuThreshold,
@@ -28,6 +31,10 @@ export interface Recognition extends ParseResult {
   confidences: number[];
   /** Lowest per-glyph confidence -- the weakest link in the read. */
   minConfidence: number;
+  /** True if the band was only found after mirroring, i.e. a flipped sensor. */
+  mirrored?: boolean;
+  /** Where the band was found, for drawing it back over the preview. */
+  bandRows?: { top: number; bottom: number };
 }
 
 function softmaxMax(logits: ArrayLike<number>): { index: number; p: number } {
@@ -60,24 +67,62 @@ export const NO_BAND: Recognition = {
  * per frame, and a frame that happens to catch a thumb should just be the next
  * frame's problem.
  */
+/**
+ * Read a whole cheque image: find the MICR line in it, then classify it.
+ *
+ * The caller hands over the entire frame, not a pre-aligned strip. Locating
+ * the band is this function's job -- which is the point, because every
+ * coordinate mapping between preview and sensor is one more thing to get
+ * wrong, and getting it wrong looks identical to a camera that sees nothing.
+ */
+export function recognizeDocument(
+  model: TensorflowModel,
+  frame: GrayImage,
+): Recognition {
+  const found = findMicrBand(frame);
+  if (!found) {
+    return { ...NO_BAND, error: 'no MICR line found in view' };
+  }
+
+  const upright = classifyBand(model, found.band, found.boxes);
+  if (upright.ok) {
+    return { ...upright, bandRows: found.rows };
+  }
+
+  // Retry mirrored. A flipped sensor produces a band that segments perfectly
+  // and classifies perfectly, then assembles backwards -- so it fails the
+  // checksum with nothing to indicate why. Geometry cannot tell the two apart,
+  // but the ABA digit can, so let it decide. Only the band is mirrored, not the
+  // whole frame, and only after an upright read has already failed.
+  const flipped = mirrorImage(found.band);
+  const boxes = findGlyphBoxes(flipped, otsuThreshold(flipped));
+  if (bandQuality(boxes) > 0) {
+    const mirrored = classifyBand(model, flipped, boxes);
+    if (mirrored.ok) {
+      return { ...mirrored, mirrored: true, bandRows: found.rows };
+    }
+  }
+  return { ...upright, bandRows: found.rows };
+}
+
+/** Read a strip already known to contain the band. */
 export function recognizeBand(model: TensorflowModel, crop: GrayImage): Recognition {
-  // Narrow to the rows the character line occupies before anything else. The
-  // guide is taller than a MICR band on purpose -- it has to be, or aiming
-  // would be impossible -- so the crop always carries extra material above and
-  // below that would otherwise poison the threshold.
   const coarse = otsuThreshold(crop);
   const rows = locateBandRows(crop, coarse);
   const band = cropRows(crop, rows.top, rows.bottom);
-
-  // Re-threshold on the narrowed strip: now that it is mostly glyphs and
-  // paper, Otsu splits where it should.
-  const threshold = otsuThreshold(band);
-  const boxes = findGlyphBoxes(band, threshold);
+  const boxes = findGlyphBoxes(band, otsuThreshold(band));
 
   if (bandQuality(boxes) <= 0) {
     return { ...NO_BAND, glyphCount: boxes.length };
   }
+  return classifyBand(model, band, boxes);
+}
 
+function classifyBand(
+  model: TensorflowModel,
+  band: GrayImage,
+  boxes: GlyphBox[],
+): Recognition {
   const classes: MicrClass[] = [];
   const confidences: number[] = [];
 

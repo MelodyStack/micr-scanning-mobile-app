@@ -15,7 +15,6 @@ import {
   Pressable,
   StyleSheet,
   Text,
-  useWindowDimensions,
   View,
 } from 'react-native';
 import {
@@ -28,10 +27,10 @@ import { useResizePlugin } from 'vision-camera-resize-plugin';
 import { loadTensorflowModel, TensorflowModel } from 'react-native-fast-tflite';
 import { useRunOnJS, useSharedValue } from 'react-native-worklets-core';
 
-import { FrameVoter, recognizeBand } from '../micr/recognize';
+import { FrameVoter, recognizeDocument } from '../micr/recognize';
 import { MicrFields } from '../micr/parse';
 import ResultCard from '../components/ResultCard';
-import ScanOverlay, { GUIDE } from '../components/ScanOverlay';
+import ScanOverlay from '../components/ScanOverlay';
 
 /**
  * Working resolution for the whole frame, in display orientation.
@@ -77,15 +76,11 @@ export default function ScanScreen() {
   const [model, setModel] = useState<TensorflowModel | null>(null);
   const [status, setStatus] = useState<Status>('loading');
   const [fields, setFields] = useState<MicrFields | null>(null);
-  const [hint, setHint] = useState('Hold the check so the number line fills the box');
+  const [hint, setHint] = useState('Fit the whole cheque in the frame');
   const [error, setError] = useState<string | null>(null);
   // Shown only in dev builds. Guessing at frame geometry from the outside cost
   // a whole debugging round; this makes it visible on the device.
   const [debug, setDebug] = useState('');
-
-  // Captured into the worklet. The screen is orientation-locked, so these are
-  // constant for the life of the scanner.
-  const { width: screenW, height: screenH } = useWindowDimensions();
 
   const voter = useRef(new FrameVoter(2));
   const busy = useRef(false);
@@ -98,16 +93,14 @@ export default function ScanScreen() {
   // catch below -- the processor span forever without ever calling onBand, so
   // the readout simply went blank.
   const rotationShared = useSharedValue<'0deg' | '90deg' | '180deg' | '270deg'>('0deg');
-  const mirrorShared = useSharedValue(false);
   const modeIndex = useRef(0);
 
   const cycleOrientation = useCallback(() => {
     modeIndex.current = (modeIndex.current + 1) % ORIENTATIONS.length;
     const next = ORIENTATIONS[modeIndex.current];
     rotationShared.value = next.rotation;
-    mirrorShared.value = next.mirror;
     voter.current.reset();
-  }, [rotationShared, mirrorShared]);
+  }, [rotationShared]);
   // Same reason in reverse -- the worklet closure would capture a stale status.
   const statusRef = useRef<Status>('loading');
   useEffect(() => {
@@ -168,32 +161,24 @@ export default function ScanScreen() {
    * inference are ordinary code that way: no 'worklet' directives threaded
    * through the whole pipeline, and the same functions the unit tests cover.
    */
-  const onBand = useRunOnJS(
-    (
-      grey: Uint8Array,
-      width: number,
-      height: number,
-      fw: number,
-      fh: number,
-      rotation: string,
-      mirror: boolean,
-    ) => {
+  const onFrame = useRunOnJS(
+    (grey: Uint8Array, width: number, height: number, fw: number, fh: number) => {
       if (!model || statusRef.current !== 'scanning') {
         busy.current = false;
         return;
       }
       try {
-        const result = recognizeBand(model, { data: grey, width, height });
+        const result = recognizeDocument(model, { data: grey, width, height });
         setDebug(
-          `${fw}x${fh} · ${rotation}${mirror ? ' mirrored' : ''} · ` +
-            `glyphs ${result.glyphCount}` +
+          `${fw}x${fh} · glyphs ${result.glyphCount}` +
+            (result.mirrored ? ' · mirrored' : '') +
             (result.raw ? `\n${result.raw}` : ''),
         );
 
         if (!result.ok) {
           setHint(
             result.glyphCount === 0
-              ? 'Line the number row up inside the box'
+              ? 'Show the whole cheque, number line included'
               : result.error ?? 'Hold steady',
           );
           return;
@@ -229,16 +214,7 @@ export default function ScanScreen() {
         // Rotate the frame to display orientation, keeping its aspect ratio,
         // then crop the guide out of the region the preview is actually
         // showing.
-        //
-        // Two things have to line up for the crop to match what the user aims
-        // at. The work image must not be stretched -- forcing a 4:3 sensor
-        // frame into a 16:9 buffer distorts the character pitch the segmenter
-        // measures. And the preview draws with resizeMode "cover", so it
-        // centre-crops the frame to fill the screen: the visible area is a
-        // sub-rectangle, and GUIDE is a fraction of *that*, not of the whole
-        // frame. Ignoring the cover crop sampled a strip well above the band.
         const rotation = rotationShared.value;
-        const mirror = mirrorShared.value;
         const quarterTurn = rotation === '90deg' || rotation === '270deg';
         // A quarter turn swaps the axes, so the output aspect flips with it.
         const srcW = quarterTurn ? frame.height : frame.width;
@@ -254,37 +230,15 @@ export default function ScanScreen() {
           dataType: 'uint8',
         });
 
-        // Replicate the preview's cover crop in work-image coordinates.
-        const cover = Math.max(screenW / workW, screenH / workH);
-        const visW = screenW / cover;
-        const visH = screenH / cover;
-        const offX = (workW - visW) / 2;
-        const offY = (workH - visH) / 2;
-
-        const x0 = Math.max(0, Math.round(offX + visW * GUIDE.x));
-        const y0 = Math.max(0, Math.round(offY + visH * GUIDE.y));
-        const bandW = Math.min(workW - x0, Math.round(visW * GUIDE.width));
-        const bandH = Math.min(workH - y0, Math.round(visH * GUIDE.height));
-
-        if (bandW < 32 || bandH < 8) {
-          busyShared.value = false;
-          return;
+        // Whole frame to luminance (ITU-R 601 weights). No crop: recognition
+        // locates the band itself, so there is nothing to map between preview
+        // and sensor coordinates and nothing for the user to line up.
+        const grey = new Uint8Array(workW * workH);
+        for (let i = 0, p = 0; i < grey.length; i++, p += 3) {
+          grey[i] = (full[p] * 77 + full[p + 1] * 150 + full[p + 2] * 29) >> 8;
         }
 
-        // Crop and convert to luminance in one pass (ITU-R 601 weights).
-        // Un-mirroring here rather than on the pixels afterwards costs nothing:
-        // the destination index simply walks backwards along each row.
-        const grey = new Uint8Array(bandW * bandH);
-        for (let y = 0; y < bandH; y++) {
-          let src = ((y0 + y) * workW + x0) * 3;
-          const rowStart = y * bandW;
-          for (let x = 0; x < bandW; x++, src += 3) {
-            const dst = rowStart + (mirror ? bandW - 1 - x : x);
-            grey[dst] = (full[src] * 77 + full[src + 1] * 150 + full[src + 2] * 29) >> 8;
-          }
-        }
-
-        onBand(grey, bandW, bandH, srcW, srcH, rotation, mirror).then(() => {
+        onFrame(grey, workW, workH, srcW, srcH).then(() => {
           busyShared.value = false;
         });
       } catch (e: any) {
@@ -296,8 +250,7 @@ export default function ScanScreen() {
       }
     },
     [
-      onBand, onWorkletError, resize, busyShared,
-      screenW, screenH, rotationShared, mirrorShared,
+      onFrame, onWorkletError, resize, busyShared, rotationShared,
     ],
   );
 
