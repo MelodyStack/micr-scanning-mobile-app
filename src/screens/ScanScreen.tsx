@@ -33,12 +33,14 @@ import ResultCard from '../components/ResultCard';
 import ScanOverlay, { GUIDE } from '../components/ScanOverlay';
 
 /**
- * Working resolution for the band. Wide enough that a 30-glyph line still has
- * ~25 px per character after the crop, tall enough to match what the model was
- * trained on without a big rescale.
+ * Working resolution for the whole frame, in display orientation.
+ *
+ * The guide is 92% of this wide, so a 30-glyph MICR line lands at roughly 30 px
+ * per character -- comfortably above what the segmenter needs to separate
+ * them, without making the per-frame luminance pass expensive.
  */
-const BAND_WIDTH = 800;
-const BAND_HEIGHT = 60;
+const WORK_WIDTH = 960;
+const WORK_HEIGHT = 540;
 
 type Status = 'loading' | 'scanning' | 'done' | 'error';
 
@@ -52,6 +54,9 @@ export default function ScanScreen() {
   const [fields, setFields] = useState<MicrFields | null>(null);
   const [hint, setHint] = useState('Hold the check so the number line fills the box');
   const [error, setError] = useState<string | null>(null);
+  // Shown only in dev builds. Guessing at frame geometry from the outside cost
+  // a whole debugging round; this makes it visible on the device.
+  const [debug, setDebug] = useState('');
 
   const voter = useRef(new FrameVoter(2));
   const busy = useRef(false);
@@ -119,17 +124,16 @@ export default function ScanScreen() {
    * through the whole pipeline, and the same functions the unit tests cover.
    */
   const onBand = useRunOnJS(
-    (grey: Uint8Array) => {
+    (grey: Uint8Array, width: number, height: number, fw: number, fh: number) => {
       if (!model || statusRef.current !== 'scanning') {
         busy.current = false;
         return;
       }
       try {
-        const result = recognizeBand(model, {
-          data: grey,
-          width: BAND_WIDTH,
-          height: BAND_HEIGHT,
-        });
+        const result = recognizeBand(model, { data: grey, width, height });
+        setDebug(
+          `frame ${fw}x${fh} → band ${width}x${height} · glyphs ${result.glyphCount}`,
+        );
 
         if (!result.ok) {
           setHint(
@@ -163,26 +167,40 @@ export default function ScanScreen() {
       busyShared.value = true;
 
       try {
-        // Crop to the guide rectangle and scale to the working band size.
-        const cropped = resize(frame, {
-          scale: { width: BAND_WIDTH, height: BAND_HEIGHT },
-          crop: {
-            x: Math.round(frame.width * GUIDE.x),
-            y: Math.round(frame.height * GUIDE.y),
-            width: Math.round(frame.width * GUIDE.width),
-            height: Math.round(frame.height * GUIDE.height),
-          },
+        // Rotate and scale the WHOLE frame to display orientation, then crop
+        // the guide out of that in plain array arithmetic.
+        //
+        // resize()'s crop rectangle is in sensor coordinates while GUIDE is in
+        // display coordinates, and the preview is rotated between the two.
+        // Cropping there sampled a different part of the frame than the box the
+        // user is aiming with -- the band was visibly inside the guide and the
+        // segmenter still saw zero glyphs, because it was being handed a patch
+        // of blank paper. Doing the crop after rotation removes the mapping
+        // entirely: what the buffer holds is what the preview shows.
+        const portraitFrame = frame.height > frame.width;
+        const full = resize(frame, {
+          scale: { width: WORK_WIDTH, height: WORK_HEIGHT },
+          rotation: portraitFrame ? '90deg' : '0deg',
           pixelFormat: 'rgb',
           dataType: 'uint8',
         });
 
-        // rgb -> luminance (ITU-R 601 weights, integer arithmetic).
-        const grey = new Uint8Array(BAND_WIDTH * BAND_HEIGHT);
-        for (let i = 0, p = 0; i < grey.length; i++, p += 3) {
-          grey[i] = (cropped[p] * 77 + cropped[p + 1] * 150 + cropped[p + 2] * 29) >> 8;
+        const x0 = Math.round(WORK_WIDTH * GUIDE.x);
+        const y0 = Math.round(WORK_HEIGHT * GUIDE.y);
+        const bandW = Math.round(WORK_WIDTH * GUIDE.width);
+        const bandH = Math.round(WORK_HEIGHT * GUIDE.height);
+
+        // Crop and convert to luminance in one pass (ITU-R 601 weights).
+        const grey = new Uint8Array(bandW * bandH);
+        for (let y = 0; y < bandH; y++) {
+          let src = ((y0 + y) * WORK_WIDTH + x0) * 3;
+          let dst = y * bandW;
+          for (let x = 0; x < bandW; x++, src += 3, dst++) {
+            grey[dst] = (full[src] * 77 + full[src + 1] * 150 + full[src + 2] * 29) >> 8;
+          }
         }
 
-        onBand(grey).then(() => {
+        onBand(grey, bandW, bandH, frame.width, frame.height).then(() => {
           busyShared.value = false;
         });
       } catch {
@@ -249,7 +267,11 @@ export default function ScanScreen() {
           photo={false}
           video={false}
         />
-        <ScanOverlay hint={hint} active={status === 'scanning'} />
+        <ScanOverlay
+          hint={hint}
+          active={status === 'scanning'}
+          debug={__DEV__ ? debug : ''}
+        />
         {fields && <ResultCard fields={fields} onRescan={reset} />}
       </>
     );

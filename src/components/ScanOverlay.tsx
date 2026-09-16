@@ -23,9 +23,11 @@ export const GUIDE = { x: 0.04, y: 0.55, width: 0.92, height: 0.14 };
 interface Props {
   hint: string;
   active: boolean;
+  /** Dev-only readout of what the frame processor is actually seeing. */
+  debug?: string;
 }
 
-export default function ScanOverlay({ hint, active }: Props) {
+export default function ScanOverlay({ hint, active, debug }: Props) {
   return (
     <View style={StyleSheet.absoluteFill} pointerEvents="none">
       {/* Dim everything outside the guide so the eye goes to the band. */}
@@ -47,6 +49,7 @@ export default function ScanOverlay({ hint, active }: Props) {
             Nothing is sent until the read passes its checksum
           </Text>
         )}
+        {!!debug && <Text style={styles.debug}>{debug}</Text>}
       </View>
     </View>
   );
@@ -80,4 +83,11 @@ const styles = StyleSheet.create({
   bottom: { flex: 1, paddingTop: 28, paddingHorizontal: 32, alignItems: 'center' },
   hint: { color: '#fff', fontSize: 16, textAlign: 'center', fontWeight: '500' },
   sub: { color: '#8b93a1', fontSize: 12, textAlign: 'center', marginTop: 8 },
+  debug: {
+    color: '#4ade80',
+    fontSize: 11,
+    fontFamily: 'monospace',
+    textAlign: 'center',
+    marginTop: 10,
+  },
 });
