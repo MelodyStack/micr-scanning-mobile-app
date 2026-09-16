@@ -88,6 +88,82 @@ function median(values: number[]): number {
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
+/**
+ * Narrow a crop down to the rows the character line actually occupies.
+ *
+ * The guide box is deliberately taller than a MICR band, so a crop of it also
+ * contains whatever sits above and below -- a signature stroke, the memo rule,
+ * the edge of the cheque. Thresholding across all of that makes a full-width
+ * dark row read as one ink run spanning the whole crop, and everything after
+ * that behaves as if there were no characters at all.
+ *
+ * Rows are scored by ink, then the densest contiguous stretch is kept. This is
+ * the same job locate_band does in the offline Python segmenter, at a smaller
+ * scale: it is looking for the line inside the frame, this for the line inside
+ * the guide.
+ */
+export function locateBandRows(
+  image: GrayImage,
+  threshold: number,
+): { top: number; bottom: number } {
+  const rowInk = new Int32Array(image.height);
+  let peak = 0;
+  for (let y = 0; y < image.height; y++) {
+    const row = y * image.width;
+    let count = 0;
+    for (let x = 0; x < image.width; x++) {
+      if (image.data[row + x] <= threshold) {
+        count++;
+      }
+    }
+    rowInk[y] = count;
+    if (count > peak) {
+      peak = count;
+    }
+  }
+  if (peak === 0) {
+    return { top: 0, bottom: image.height };
+  }
+
+  // A row belongs to the line if it carries a reasonable share of the peak.
+  // Low enough to keep the thin waist of a glyph, high enough to exclude a
+  // faint background rule.
+  const cutoff = peak * 0.18;
+  let bestTop = 0;
+  let bestLen = 0;
+  let runStart = -1;
+  for (let y = 0; y <= image.height; y++) {
+    const inked = y < image.height && rowInk[y] >= cutoff;
+    if (inked && runStart < 0) {
+      runStart = y;
+    } else if (!inked && runStart >= 0) {
+      if (y - runStart > bestLen) {
+        bestLen = y - runStart;
+        bestTop = runStart;
+      }
+      runStart = -1;
+    }
+  }
+  if (bestLen === 0) {
+    return { top: 0, bottom: image.height };
+  }
+
+  const pad = Math.max(2, Math.round(bestLen * 0.18));
+  return {
+    top: Math.max(0, bestTop - pad),
+    bottom: Math.min(image.height, bestTop + bestLen + pad),
+  };
+}
+
+export function cropRows(image: GrayImage, top: number, bottom: number): GrayImage {
+  const height = Math.max(1, bottom - top);
+  return {
+    data: image.data.subarray(top * image.width, (top + height) * image.width),
+    width: image.width,
+    height,
+  };
+}
+
 export interface SegmentOptions {
   /** Centre hops below this fraction of a run's width are inside one glyph. */
   pitchMinFrac?: number;
@@ -134,7 +210,12 @@ export function findGlyphBoxes(
     runs.push({ x0: start, x1: projection.length });
   }
 
-  const inner = runs.filter(r => r.x0 > 0 && r.x1 < projection.length);
+  // Runs touching the edge are usually the guide border or a neighbouring
+  // field bleeding in -- but only drop them if something is left. When the
+  // whole crop binarises to one edge-to-edge run, discarding it returned zero
+  // glyphs and the caller could not tell "nothing here" from "one big blob".
+  const trimmed = runs.filter(r => r.x0 > 0 && r.x1 < projection.length);
+  const inner = trimmed.length >= 2 ? trimmed : runs;
   if (inner.length < 2) {
     return inner;
   }

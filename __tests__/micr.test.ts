@@ -4,6 +4,8 @@ import {
   findGlyphBoxes,
   otsuThreshold,
   bandQuality,
+  cropRows,
+  locateBandRows,
   cropGlyph,
   GrayImage,
 } from '../src/micr/segment';
@@ -199,5 +201,53 @@ describe('segmentation', () => {
     }
     // The crop must contain ink, otherwise the box is in the wrong place.
     expect(Math.min(...crop)).toBeLessThan(0.3);
+  });
+});
+
+describe('band row localisation', () => {
+  /** A band crop with the line in the middle and clutter above it. */
+  function cluttered(): GrayImage {
+    const width = 400;
+    const height = 90;
+    const data = new Uint8Array(width * height).fill(235);
+    // A full-width dark rule near the top -- a signature line or cheque edge.
+    for (let x = 0; x < width; x++) {
+      data[8 * width + x] = 30;
+      data[9 * width + x] = 30;
+    }
+    // The actual glyph row, further down.
+    for (let i = 0; i < 12; i++) {
+      const x0 = 20 + i * 30;
+      for (let y = 40; y < 70; y++) {
+        for (let x = x0; x < x0 + 14; x++) {
+          data[y * width + x] = 25;
+        }
+      }
+    }
+    return { data, width, height };
+  }
+
+  it('finds the glyph rows and excludes the rule above them', () => {
+    const img = cluttered();
+    const rows = locateBandRows(img, otsuThreshold(img));
+    expect(rows.top).toBeGreaterThan(12);
+    expect(rows.bottom).toBeLessThanOrEqual(90);
+    expect(rows.bottom - rows.top).toBeGreaterThan(20);
+  });
+
+  it('segments the cluttered crop that used to yield nothing', () => {
+    const img = cluttered();
+    const rows = locateBandRows(img, otsuThreshold(img));
+    const band = cropRows(img, rows.top, rows.bottom);
+    expect(findGlyphBoxes(band, otsuThreshold(band))).toHaveLength(12);
+  });
+
+  it('keeps edge-touching runs rather than returning nothing', () => {
+    // One blob spanning the full width: dropping it left zero boxes before.
+    const width = 200;
+    const height = 40;
+    const data = new Uint8Array(width * height).fill(20);
+    const boxes = findGlyphBoxes({ data, width, height }, 128);
+    expect(boxes.length).toBeGreaterThanOrEqual(1);
   });
 });

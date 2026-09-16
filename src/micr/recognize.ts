@@ -15,8 +15,10 @@ import { parseMicr, ParseResult } from './parse';
 import {
   bandQuality,
   cropGlyph,
+  cropRows,
   findGlyphBoxes,
   GrayImage,
+  locateBandRows,
   otsuThreshold,
 } from './segment';
 
@@ -58,7 +60,17 @@ export const NO_BAND: Recognition = {
  * per frame, and a frame that happens to catch a thumb should just be the next
  * frame's problem.
  */
-export function recognizeBand(model: TensorflowModel, band: GrayImage): Recognition {
+export function recognizeBand(model: TensorflowModel, crop: GrayImage): Recognition {
+  // Narrow to the rows the character line occupies before anything else. The
+  // guide is taller than a MICR band on purpose -- it has to be, or aiming
+  // would be impossible -- so the crop always carries extra material above and
+  // below that would otherwise poison the threshold.
+  const coarse = otsuThreshold(crop);
+  const rows = locateBandRows(crop, coarse);
+  const band = cropRows(crop, rows.top, rows.bottom);
+
+  // Re-threshold on the narrowed strip: now that it is mostly glyphs and
+  // paper, Otsu splits where it should.
   const threshold = otsuThreshold(band);
   const boxes = findGlyphBoxes(band, threshold);
 
