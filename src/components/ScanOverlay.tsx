@@ -9,8 +9,16 @@
 import React from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 
-/** Guide rectangle as a fraction of the frame. Must match the frame processor. */
-export const GUIDE = { x: 0.06, y: 0.42, width: 0.88, height: 0.16 };
+/**
+ * Guide rectangle as a fraction of the frame. Must match the frame processor.
+ *
+ * The screen is locked to landscape, so this is a wide, shallow strip sized
+ * like the MICR band itself: the band runs almost the full width of a cheque
+ * and is only a few millimetres tall. Sitting it slightly below centre matches
+ * where it falls when the whole cheque is in view, since the band is near the
+ * bottom edge.
+ */
+export const GUIDE = { x: 0.04, y: 0.55, width: 0.92, height: 0.14 };
 
 interface Props {
   hint: string;
