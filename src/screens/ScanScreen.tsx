@@ -52,18 +52,12 @@ const WORK_WIDTH = 960;
  * active, so the right one can be found on the device in a few seconds rather
  * than guessed at from here.
  */
-export const ORIENTATIONS: {
-  rotation: '0deg' | '90deg' | '180deg' | '270deg';
-  mirror: boolean;
-}[] = [
-  { rotation: '0deg', mirror: false },
-  { rotation: '0deg', mirror: true },
-  { rotation: '90deg', mirror: false },
-  { rotation: '90deg', mirror: true },
-  { rotation: '180deg', mirror: false },
-  { rotation: '180deg', mirror: true },
-  { rotation: '270deg', mirror: false },
-  { rotation: '270deg', mirror: true },
+export const ORIENTATIONS: ('auto' | '0deg' | '90deg' | '180deg' | '270deg')[] = [
+  'auto',
+  '90deg',
+  '270deg',
+  '180deg',
+  '0deg',
 ];
 
 type Status = 'loading' | 'scanning' | 'done' | 'error';
@@ -92,13 +86,13 @@ export default function ScanScreen() {
   // one leaves it undefined, and the resulting throw was being swallowed by the
   // catch below -- the processor span forever without ever calling onBand, so
   // the readout simply went blank.
-  const rotationShared = useSharedValue<'0deg' | '90deg' | '180deg' | '270deg'>('0deg');
+  const rotationShared =
+    useSharedValue<'auto' | '0deg' | '90deg' | '180deg' | '270deg'>('auto');
   const modeIndex = useRef(0);
 
   const cycleOrientation = useCallback(() => {
     modeIndex.current = (modeIndex.current + 1) % ORIENTATIONS.length;
-    const next = ORIENTATIONS[modeIndex.current];
-    rotationShared.value = next.rotation;
+    rotationShared.value = ORIENTATIONS[modeIndex.current];
     voter.current.reset();
   }, [rotationShared]);
   // Same reason in reverse -- the worklet closure would capture a stale status.
@@ -162,7 +156,14 @@ export default function ScanScreen() {
    * through the whole pipeline, and the same functions the unit tests cover.
    */
   const onFrame = useRunOnJS(
-    (grey: Uint8Array, width: number, height: number, fw: number, fh: number) => {
+    (
+      grey: Uint8Array,
+      width: number,
+      height: number,
+      fw: number,
+      fh: number,
+      rotation: string,
+    ) => {
       if (!model || statusRef.current !== 'scanning') {
         busy.current = false;
         return;
@@ -170,7 +171,7 @@ export default function ScanScreen() {
       try {
         const result = recognizeDocument(model, { data: grey, width, height });
         setDebug(
-          `${fw}x${fh} · glyphs ${result.glyphCount}` +
+          `${fw}x${fh} ${rotation} · glyphs ${result.glyphCount}` +
             (result.mirrored ? ' · mirrored' : '') +
             (result.raw ? `\n${result.raw}` : ''),
         );
@@ -214,7 +215,17 @@ export default function ScanScreen() {
         // Rotate the frame to display orientation, keeping its aspect ratio,
         // then crop the guide out of the region the preview is actually
         // showing.
-        const rotation = rotationShared.value;
+        // 'auto' until the user overrides by tapping. The screen is locked to
+        // landscape, so a portrait sensor frame always needs a quarter turn --
+        // without it the cheque sits sideways in the work image, the MICR band
+        // runs vertically, and a search that scans rows finds nothing at all.
+        const requested = rotationShared.value;
+        const rotation =
+          requested === 'auto'
+            ? frame.height > frame.width
+              ? '90deg'
+              : '0deg'
+            : requested;
         const quarterTurn = rotation === '90deg' || rotation === '270deg';
         // A quarter turn swaps the axes, so the output aspect flips with it.
         const srcW = quarterTurn ? frame.height : frame.width;
@@ -238,7 +249,7 @@ export default function ScanScreen() {
           grey[i] = (full[p] * 77 + full[p + 1] * 150 + full[p + 2] * 29) >> 8;
         }
 
-        onFrame(grey, workW, workH, srcW, srcH).then(() => {
+        onFrame(grey, workW, workH, srcW, srcH, rotation).then(() => {
           busyShared.value = false;
         });
       } catch (e: any) {
