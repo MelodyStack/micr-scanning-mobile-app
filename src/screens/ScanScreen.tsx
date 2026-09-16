@@ -72,19 +72,36 @@ export default function ScanScreen() {
 
   useEffect(() => {
     let cancelled = false;
-    // Second argument is the delegate list. 'nnapi' asks Android to use any
-    // hardware accelerator it has; it falls back to CPU on its own, and the
-    // model is small enough that CPU is fine either way.
-    loadTensorflowModel(require('../../assets/micr_cnn_v1.tflite'), ['nnapi'])
+
+    /**
+     * Load on CPU, and only then try to upgrade to a hardware delegate.
+     *
+     * NNAPI is absent or broken on plenty of devices -- emulators especially --
+     * and asking for it up front takes the whole app down rather than falling
+     * back. The model is 123k parameters on a 48x32 crop, so CPU is perfectly
+     * fast; the delegate is a bonus, never a requirement.
+     */
+    const asset = require('../../assets/micr_cnn_v1.tflite');
+    loadTensorflowModel(asset, [])
       .then(loaded => {
-        if (!cancelled) {
-          setModel(loaded);
-          setStatus('scanning');
+        if (cancelled) {
+          return;
         }
+        setModel(loaded);
+        setStatus('scanning');
+        // Opportunistic upgrade. If it throws, we keep the CPU model already
+        // running and the user never notices.
+        loadTensorflowModel(asset, ['nnapi'])
+          .then(accelerated => {
+            if (!cancelled) {
+              setModel(accelerated);
+            }
+          })
+          .catch(() => {});
       })
       .catch(e => {
         if (!cancelled) {
-          setError(`Could not load the model: ${e.message}`);
+          setError(`Could not load the model: ${e?.message ?? e}`);
           setStatus('error');
         }
       });
