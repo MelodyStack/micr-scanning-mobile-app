@@ -15,6 +15,7 @@ import {
   Pressable,
   StyleSheet,
   Text,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import {
@@ -40,7 +41,6 @@ import ScanOverlay, { GUIDE } from '../components/ScanOverlay';
  * them, without making the per-frame luminance pass expensive.
  */
 const WORK_WIDTH = 960;
-const WORK_HEIGHT = 540;
 
 type Status = 'loading' | 'scanning' | 'done' | 'error';
 
@@ -57,6 +57,10 @@ export default function ScanScreen() {
   // Shown only in dev builds. Guessing at frame geometry from the outside cost
   // a whole debugging round; this makes it visible on the device.
   const [debug, setDebug] = useState('');
+
+  // Captured into the worklet. The screen is orientation-locked, so these are
+  // constant for the life of the scanner.
+  const { width: screenW, height: screenH } = useWindowDimensions();
 
   const voter = useRef(new FrameVoter(2));
   const busy = useRef(false);
@@ -167,47 +171,66 @@ export default function ScanScreen() {
       busyShared.value = true;
 
       try {
-        // Rotate and scale the WHOLE frame to display orientation, then crop
-        // the guide out of that in plain array arithmetic.
+        // Rotate the frame to display orientation, keeping its aspect ratio,
+        // then crop the guide out of the region the preview is actually
+        // showing.
         //
-        // resize()'s crop rectangle is in sensor coordinates while GUIDE is in
-        // display coordinates, and the preview is rotated between the two.
-        // Cropping there sampled a different part of the frame than the box the
-        // user is aiming with -- the band was visibly inside the guide and the
-        // segmenter still saw zero glyphs, because it was being handed a patch
-        // of blank paper. Doing the crop after rotation removes the mapping
-        // entirely: what the buffer holds is what the preview shows.
+        // Two things have to line up for the crop to match what the user aims
+        // at. The work image must not be stretched -- forcing a 4:3 sensor
+        // frame into a 16:9 buffer distorts the character pitch the segmenter
+        // measures. And the preview draws with resizeMode "cover", so it
+        // centre-crops the frame to fill the screen: the visible area is a
+        // sub-rectangle, and GUIDE is a fraction of *that*, not of the whole
+        // frame. Ignoring the cover crop sampled a strip well above the band.
         const portraitFrame = frame.height > frame.width;
+        const srcW = portraitFrame ? frame.height : frame.width;
+        const srcH = portraitFrame ? frame.width : frame.height;
+
+        const workW = WORK_WIDTH;
+        const workH = Math.max(2, Math.round((workW * srcH) / srcW));
+
         const full = resize(frame, {
-          scale: { width: WORK_WIDTH, height: WORK_HEIGHT },
+          scale: { width: workW, height: workH },
           rotation: portraitFrame ? '90deg' : '0deg',
           pixelFormat: 'rgb',
           dataType: 'uint8',
         });
 
-        const x0 = Math.round(WORK_WIDTH * GUIDE.x);
-        const y0 = Math.round(WORK_HEIGHT * GUIDE.y);
-        const bandW = Math.round(WORK_WIDTH * GUIDE.width);
-        const bandH = Math.round(WORK_HEIGHT * GUIDE.height);
+        // Replicate the preview's cover crop in work-image coordinates.
+        const cover = Math.max(screenW / workW, screenH / workH);
+        const visW = screenW / cover;
+        const visH = screenH / cover;
+        const offX = (workW - visW) / 2;
+        const offY = (workH - visH) / 2;
+
+        const x0 = Math.max(0, Math.round(offX + visW * GUIDE.x));
+        const y0 = Math.max(0, Math.round(offY + visH * GUIDE.y));
+        const bandW = Math.min(workW - x0, Math.round(visW * GUIDE.width));
+        const bandH = Math.min(workH - y0, Math.round(visH * GUIDE.height));
+
+        if (bandW < 32 || bandH < 8) {
+          busyShared.value = false;
+          return;
+        }
 
         // Crop and convert to luminance in one pass (ITU-R 601 weights).
         const grey = new Uint8Array(bandW * bandH);
         for (let y = 0; y < bandH; y++) {
-          let src = ((y0 + y) * WORK_WIDTH + x0) * 3;
+          let src = ((y0 + y) * workW + x0) * 3;
           let dst = y * bandW;
           for (let x = 0; x < bandW; x++, src += 3, dst++) {
             grey[dst] = (full[src] * 77 + full[src + 1] * 150 + full[src + 2] * 29) >> 8;
           }
         }
 
-        onBand(grey, bandW, bandH, frame.width, frame.height).then(() => {
+        onBand(grey, bandW, bandH, srcW, srcH).then(() => {
           busyShared.value = false;
         });
       } catch {
         busyShared.value = false;
       }
     },
-    [onBand, resize, busyShared],
+    [onBand, resize, busyShared, screenW, screenH],
   );
 
   const reset = useCallback(() => {
