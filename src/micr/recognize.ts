@@ -17,7 +17,14 @@
 
 import type { TfliteModel } from 'react-native-fast-tflite';
 
-import { classAt, INPUT_HEIGHT, INPUT_WIDTH, type MicrClass, toSymbols } from './classes';
+import {
+  classAt,
+  INPUT_HEIGHT,
+  INPUT_WIDTH,
+  type MicrClass,
+  SUBSTITUTION,
+  toSymbols,
+} from './classes';
 import { CLASSES } from './classes';
 import {
   buildPyramid,
@@ -186,6 +193,60 @@ export function softmaxPeak(logits: ArrayLike<number>): { index: number; p: numb
   return { index: best, p: 1 / sum };
 }
 
+/** Full softmax, so a runner-up can be reconsidered without re-running the model. */
+export function softmaxAll(logits: ArrayLike<number>): number[] {
+  let max = -Infinity;
+  for (let i = 0; i < logits.length; i++) {
+    if (logits[i] > max) {
+      max = logits[i];
+    }
+  }
+  let sum = 0;
+  const out: number[] = [];
+  for (let i = 0; i < logits.length; i++) {
+    const e = Math.exp(logits[i] - max);
+    out.push(e);
+    sum += e;
+  }
+  return out.map(e => e / sum);
+}
+
+const SYMBOLS = new Set(['T', 'A', 'O', 'D']);
+
+/**
+ * Confidence below which a symbol is worth reconsidering.
+ *
+ * The four E-13B symbols are the glyphs the model is least sure about -- they
+ * are the ones built from separate strokes, and the ones a soft or tilted crop
+ * blurs into each other. A real capture came back one character from perfect,
+ * with a transit read as a dash at 0.37.
+ */
+const UNSURE = 0.9;
+
+/**
+ * How many symbols may be reconsidered in one line. One is enough for every
+ * case seen so far; the cap keeps the search from wandering.
+ */
+const MAX_SYMBOL_SWAPS = 2;
+
+/**
+ * Probability a class needs before it is worth reconsidering a glyph as that
+ * class instead.
+ *
+ * This is what keeps the transit repair honest. A MICR line must carry exactly
+ * two transit symbols, so a line with one is missing a transit somewhere -- but
+ * simply trying every position would mean thirty attempts, and the ABA checksum
+ * passes by luck about one time in ten. That trades a rejected scan for an
+ * invented one.
+ *
+ * Restricting it to positions the model itself ranked as a possible transit
+ * collapses that to one or two candidates. On the real capture this was built
+ * for, the misread second transit scored `2=0.384  5=0.164  T=0.127`: transit
+ * is right there in the model's own ranking, and no other position on the line
+ * came close.
+ */
+const MIN_ALTERNATIVE = 0.05;
+
 /**
  * Read a cheque photo.
  *
@@ -345,8 +406,19 @@ function toPixels(region: Rect, image: GrayImage): Rect {
   };
 }
 
+/**
+ * How well does this rotation parse as E-13B? No model calls, just geometry.
+ *
+ * Both threshold modes, deliberately. `readBands` only reaches for the adaptive
+ * pass when Otsu finds no candidate at all, so this stays cheap on an ordinary
+ * cheque -- but passing Otsu alone made the probe blind to exactly the images
+ * that need adaptive. On a real capture with glare across the paper, Otsu found
+ * zero candidates, every rotation scored zero, and the read gave up before the
+ * adaptive path it would have succeeded on was ever tried: `tried 0, glyphs 0`
+ * on a photo whose MICR line is perfectly legible.
+ */
 function bestQuality(image: GrayImage, config: SegmentConfig): number {
-  return readBands(image, config, ['otsu'])[0]?.rank ?? 0;
+  return readBands(image, config, ['otsu', 'adaptive'])[0]?.rank ?? 0;
 }
 
 function record(seen: string[], raw: string): void {
@@ -373,6 +445,10 @@ interface BandClassification {
   glyphCount: number;
   /** Spacing to the next glyph, in character cells. */
   steps: number[];
+  /** Runner-up symbol for each position, where the model was unsure. */
+  swaps: { index: number; to: string }[];
+  /** Positions the model thought might be a transit, best first. */
+  transitCandidates: { index: number; p: number }[];
 }
 
 /**
@@ -413,24 +489,187 @@ function classifyBand(
 ): BandClassification {
   const classes: MicrClass[] = [];
   const confidences: number[] = [];
+  const swaps: { index: number; to: string }[] = [];
+  const transitCandidates: { index: number; p: number }[] = [];
+  const transitIndex = CLASSES.indexOf('transit');
 
-  for (const box of boxes) {
+  boxes.forEach((box, position) => {
     const input = cropGlyph(band, box, config);
     // runSync takes and returns raw ArrayBuffers. The model wants
     // [1, 48, 32, 1] NHWC float32 in 0..1; normalisation is a layer inside the
     // model, so the crop goes straight across with no mean/std applied here.
-    const [raw] = model.runSync([input.buffer as ArrayBuffer]);
-    const { index, p } = softmaxPeak(new Float32Array(raw));
-    classes.push(classAt(index));
-    confidences.push(p);
-  }
+    const [logits] = model.runSync([input.buffer as ArrayBuffer]);
+    const probabilities = softmaxAll(new Float32Array(logits));
+
+    let best = 0;
+    for (let i = 1; i < probabilities.length; i++) {
+      if (probabilities[i] > probabilities[best]) {
+        best = i;
+      }
+    }
+    const label = SUBSTITUTION[classAt(best)];
+    classes.push(classAt(best));
+    confidences.push(probabilities[best]);
+
+    // Note the runner-up while the probabilities are still to hand. Only
+    // symbol-for-symbol, and only where the model was unsure: digits are never
+    // reconsidered, so the routing and account numbers are exactly as read.
+    if (SYMBOLS.has(label) && probabilities[best] < UNSURE) {
+      let alternative = -1;
+      for (let i = 0; i < probabilities.length; i++) {
+        if (i === best || !SYMBOLS.has(SUBSTITUTION[classAt(i)])) {
+          continue;
+        }
+        if (alternative < 0 || probabilities[i] > probabilities[alternative]) {
+          alternative = i;
+        }
+      }
+      if (alternative >= 0) {
+        swaps.push({ index: position, to: SUBSTITUTION[classAt(alternative)] });
+      }
+    }
+
+    // Separately, note anywhere the model gave transit a real chance -- digits
+    // included. The transit pair is mandatory, so a line carrying only one has
+    // lost one, and these are the only places worth looking.
+    if (
+      label !== 'T' &&
+      transitIndex >= 0 &&
+      probabilities[transitIndex] >= MIN_ALTERNATIVE
+    ) {
+      transitCandidates.push({ index: position, p: probabilities[transitIndex] });
+    }
+  });
+  transitCandidates.sort((a, b) => b.p - a.p);
 
   return {
     raw: toSymbols(classes),
     confidences,
     glyphCount: boxes.length,
     steps: cellSteps(boxes),
+    swaps,
+    transitCandidates,
   };
+}
+
+/**
+ * Retry a failed read with a few leading characters discarded.
+ *
+ * Cheques carry print to the left of the MICR band -- vertical micro-text along
+ * the edge, border rules, the odd speck -- and when it falls within a couple of
+ * pitches of the first character the band search keeps it. The result is a line
+ * that is exactly right with junk bolted on the front: a real capture read
+ * `777O00279106OT062206295T5500272066O`, where everything after the `777` is
+ * correct to the character.
+ *
+ * Only the *leading* side is trimmed, and only up to three characters. The
+ * trailing side holds the account number, so dropping characters there would
+ * quietly shorten it; the leading side holds the auxiliary cheque number, which
+ * has to match `O<digits>O` exactly for the trimmed string to parse at all.
+ *
+ * This was unsafe until the missing-digit check existed. One cheque used to
+ * arrive with identical-looking leading junk *and* two account digits dropped,
+ * so trimming turned a safe rejection into a wrong account number that passed
+ * the checksum. `hasMissingDigits` now catches that case on its own merits, so
+ * the strictness here is no longer the only thing standing in the way.
+ *
+ * Costs nothing: the glyphs are already classified, so this is string slicing.
+ */
+const MAX_LEADING_TRIM = 3;
+
+function parseAllowingLeadingJunk(
+  raw: string,
+  steps: number[],
+): { parsed: ParseResult; trimmed: number } {
+  const direct = parseMicr(raw);
+  if (direct.ok && !hasMissingDigits(raw, steps)) {
+    return { parsed: direct, trimmed: 0 };
+  }
+  for (let lead = 1; lead <= MAX_LEADING_TRIM && lead < raw.length; lead++) {
+    const candidate = raw.slice(lead);
+    const parsed = parseMicr(candidate);
+    if (parsed.ok && !hasMissingDigits(candidate, steps.slice(lead))) {
+      return { parsed: { ...parsed, raw }, trimmed: lead };
+    }
+  }
+  return { parsed: direct, trimmed: 0 };
+}
+
+/**
+ * Retry with an unsure symbol replaced by the model's second choice.
+ *
+ * The four E-13B symbols are drawn from separate strokes, so a soft or slightly
+ * tilted crop blurs them into one another -- and the line's whole structure
+ * hangs off them, because they are what delimit the fields. A real capture came
+ * back one character from perfect: a transit read as a dash at 0.37
+ * confidence, leaving one transit symbol where the parser needs two.
+ *
+ * Only symbols are reconsidered, and only where the model was unsure. Digits
+ * are never touched, so the routing and account numbers stay exactly as
+ * classified, and a swap still has to satisfy the ABA checksum, the field
+ * structure and the missing-digit check before it is accepted. It costs nothing
+ * to try: the runner-up came out of the same softmax as the winner.
+ */
+function repairSymbols(
+  raw: string,
+  steps: number[],
+  swaps: { index: number; to: string }[],
+  transitCandidates: { index: number; p: number }[],
+): { parsed: ParseResult; repaired: string } | null {
+  if (swaps.length === 0 && transitCandidates.length === 0) {
+    return null;
+  }
+  const attempt = (candidate: string) => {
+    const result = parseAllowingLeadingJunk(candidate, steps);
+    return result.parsed.ok && !hasMissingDigits(candidate, steps)
+      ? { parsed: { ...result.parsed, raw }, repaired: candidate }
+      : null;
+  };
+
+  // Structural candidates, on top of the confidence-based ones. The transit
+  // pair is mandatory -- exactly two of them delimit the routing number -- so a
+  // line carrying only one has lost a transit to something, and the dash is the
+  // overwhelming favourite: both are drawn from separate strokes, and they are
+  // the pair the model confuses. Confidence does not help here. On a real
+  // tilted capture the wrong reading scored above 0.90, so a threshold that
+  // caught it would have reconsidered half the line.
+  //
+  // Promotion is not trusted on its own: the nine characters it exposes still
+  // have to be digits and still have to satisfy the ABA checksum, on top of the
+  // field structure and the missing-digit check.
+  const structural: { index: number; to: string }[] = [];
+  if ((raw.match(/T/g) ?? []).length === 1) {
+    for (const candidate of transitCandidates.slice(0, 4)) {
+      structural.push({ index: candidate.index, to: 'T' });
+    }
+  }
+
+  const shortlist = [...swaps, ...structural].slice(0, 12);
+  for (const swap of shortlist) {
+    const once =
+      raw.slice(0, swap.index) + swap.to + raw.slice(swap.index + 1);
+    const hit = attempt(once);
+    if (hit) {
+      return hit;
+    }
+  }
+  if (MAX_SYMBOL_SWAPS < 2) {
+    return null;
+  }
+  for (let a = 0; a < shortlist.length; a++) {
+    for (let b = a + 1; b < shortlist.length; b++) {
+      let candidate = raw;
+      for (const swap of [shortlist[a], shortlist[b]]) {
+        candidate =
+          candidate.slice(0, swap.index) + swap.to + candidate.slice(swap.index + 1);
+      }
+      const hit = attempt(candidate);
+      if (hit) {
+        return hit;
+      }
+    }
+  }
+  return null;
 }
 
 function finish(
@@ -441,14 +680,30 @@ function finish(
   attempts: number,
   candidates: string[],
 ): Recognition {
-  let parsed = parseMicr(classification.raw);
-  if (parsed.ok && hasMissingDigits(classification.raw, classification.steps)) {
-    parsed = {
-      ok: false,
-      raw: classification.raw,
-      error: 'a character is missing from the middle of a number',
-    };
-  }
+  const { parsed: settled } = parseAllowingLeadingJunk(
+    classification.raw,
+    classification.steps,
+  );
+  const repaired = settled.ok
+    ? null
+    : repairSymbols(
+        classification.raw,
+        classification.steps,
+        classification.swaps,
+        classification.transitCandidates,
+      );
+
+  const parsed: ParseResult = settled.ok
+    ? settled
+    : repaired
+      ? repaired.parsed
+      : parseMicr(classification.raw).ok
+        ? {
+            ok: false,
+            raw: classification.raw,
+            error: 'a character is missing from the middle of a number',
+          }
+        : settled;
   return {
     ...parsed,
     raw: classification.raw,

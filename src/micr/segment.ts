@@ -49,7 +49,17 @@ export interface SegmentConfig {
   bandPadFrac: number;
   /** Centre hops below this fraction of a run's width are inside one glyph. */
   pitchMinFrac: number;
-  /** Lone marks further than this many pitches from a neighbour are not glyphs. */
+  /**
+   * Gap, in pitches, that ends one chain of print and starts another.
+   *
+   * Measured across the real cheque photos in the training repo: every cheque
+   * that segments to exactly the right glyph count has a largest internal gap
+   * of 1.24 to 1.46 pitches, those being the blank cells between MICR fields.
+   * A capture whose band picked up micro-print from the sheet's left edge put
+   * that junk 2.96 pitches out. 2.0 sits between the two with room either side;
+   * the training repo's 3.0 was tuned before any of this was measured and let
+   * the junk through.
+   */
   maxNeighbourPitch: number;
   /** Runs narrower than this fraction of a glyph are specks. */
   minGlyphWidthFrac: number;
@@ -73,7 +83,7 @@ export const DEFAULT_CONFIG: SegmentConfig = {
   maxBandHeightFrac: 0.16,
   bandPadFrac: 0.22,
   pitchMinFrac: 0.6,
-  maxNeighbourPitch: 3.0,
+  maxNeighbourPitch: 2.0,
   minGlyphWidthFrac: 0.12,
   cropPadFrac: 0.18,
   columnNoiseFrac: 0.05,
@@ -336,26 +346,40 @@ export function findGlyphBoxes(
     }
   }
 
-  // Keep only the longest chain of closely-spaced runs.
+  // Drop junk chains, keep the fields.
   //
-  // A cheque's border rules and corner specks sit a long way from the line, and
-  // the obvious filter -- drop anything with no near neighbour -- does not
-  // remove them, because they arrive in clusters that protect each other. On a
-  // real cheque the leading junk was three marks 24 and 33 px apart sitting
-  // 132 px from the band: every one of them has a close neighbour, so every one
-  // survived, and the read came back with seven extra characters.
+  // A cheque's border rules, corner specks and edge micro-print sit apart from
+  // the band, and the obvious filter -- drop anything with no near neighbour --
+  // does not remove them, because they arrive in clusters that protect each
+  // other. On one capture the leading junk was three marks 24 and 33 px apart
+  // sitting 132 px out: every one had a close neighbour, so every one survived
+  // and the read came back seven characters too long.
   //
-  // Splitting the runs into chains and keeping the longest is the global
-  // version of the same idea, and the MICR line always wins it: it is 20 to 40
-  // characters of constant pitch, and the junk around it never is.
+  // Splitting into chains is the global version of that idea. What the chains
+  // are then judged on is **length, not distance**. Keeping the longest chain
+  // was the first attempt and it is wrong: the gap before the on-us field is a
+  // genuine field boundary and on a real cheque it measured 2.21 pitches, so
+  // the account number split off into its own chain and was thrown away --
+  // `O010454OT111000614T` with all eleven characters of the account missing.
+  //
+  // Junk arrives in ones and twos, occasionally five. A MICR field never does:
+  // the transit field is eleven characters, the on-us nine to thirteen. So the
+  // substantial chains are all kept and rejoined, and only short ones at the
+  // very ends are discarded. A short chain *between* two kept ones stays, since
+  // it is part of the line whatever it is.
   if (kept.length >= 3) {
     const chains = splitIntoChains(kept, stats.pitch * config.maxNeighbourPitch);
-    const longest = chains.reduce((a, b) => (b.length > a.length ? b : a));
-    if (longest.length >= 2 && longest.length < kept.length) {
-      kept = longest;
-      stats = estimatePitch(kept, config);
-      if (!isFinite(stats.pitch) || stats.pitch <= 1) {
-        return kept;
+    const substantial = chains.map(c => c.length >= MIN_CHAIN_GLYPHS);
+    const first = substantial.indexOf(true);
+    const last = substantial.lastIndexOf(true);
+    if (first >= 0 && (first > 0 || last < chains.length - 1)) {
+      const merged = chains.slice(first, last + 1).flat();
+      if (merged.length >= 2 && merged.length < kept.length) {
+        kept = merged;
+        stats = estimatePitch(kept, config);
+        if (!isFinite(stats.pitch) || stats.pitch <= 1) {
+          return kept;
+        }
       }
     }
   }
@@ -656,6 +680,15 @@ export interface BandReading {
   /** Deskew slope applied, dy/dx. */
   slope: number;
 }
+
+/**
+ * Shortest chain of runs still treated as part of the line rather than junk.
+ *
+ * The auxiliary field is the shortest real field, at six characters including
+ * its delimiters. Junk clusters on the cheques seen so far run from one mark to
+ * five.
+ */
+const MIN_CHAIN_GLYPHS = 6;
 
 /** A MICR line is 2 transit symbols + 9 routing digits + an account, and up. */
 const PLAUSIBLE_MIN_GLYPHS = 19;

@@ -16,7 +16,7 @@
  * is Skia, and recognition is ordinary TypeScript on the JS thread.
  */
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Linking,
@@ -93,9 +93,7 @@ export default function ScanScreen() {
   const [error, setError] = useState<string | null>(null);
   const [torch, setTorch] = useState(false);
   const [note, setNote] = useState('Fill the frame with the cheque, then tap');
-  const [elapsed, setElapsed] = useState(0);
   // True when the capture came from the preview snapshot rather than the sensor.
-  const [lowRes, setLowRes] = useState(false);
   const lowResRef = useRef(false);
 
   useEffect(() => {
@@ -130,6 +128,7 @@ export default function ScanScreen() {
           setPhase('error');
           return;
         }
+        trace(`model: ${describeModel(loaded)}`);
         setModel(loaded);
         setPhase('ready');
 
@@ -175,8 +174,13 @@ export default function ScanScreen() {
 
         trace('recognize: start');
         const result = recognizeCheque(model, pyramid);
-        trace(`recognize: done ok=${result.ok} glyphs=${result.glyphCount}`);
-        setElapsed(Date.now() - started);
+        trace(
+          `recognize: done ok=${result.ok} glyphs=${result.glyphCount} ` +
+            `${result.quarterTurns * 90}deg ${result.threshold ?? '-'} ` +
+            `tried=${result.attempts} ` +
+            `minconf=${(result.minConfidence * 100).toFixed(0)}% ` +
+            `${Date.now() - started}ms${result.raw ? ` raw=${result.raw}` : ''}`,
+        );
         setReading(result);
 
         if (result.ok && result.fields) {
@@ -246,7 +250,6 @@ export default function ScanScreen() {
         );
       }
       lowResRef.current = degraded;
-      setLowRes(degraded);
       await read(() => decodePyramid(path));
     } catch (e: any) {
       setPhase('ready');
@@ -261,29 +264,6 @@ export default function ScanScreen() {
     setNote('Fill the frame with the cheque, then tap');
   }, []);
 
-  const debug = useMemo(() => {
-    if (!__DEV__) {
-      return '';
-    }
-    const parts: string[] = [];
-    if (model) {
-      parts.push(describeModel(model));
-    }
-    if (reading) {
-      parts.push(
-        `glyphs ${reading.glyphCount} · ${reading.quarterTurns * 90}°` +
-          (reading.mirrored ? ' · mirrored' : '') +
-          ` · ${reading.threshold ?? '—'} · tried ${reading.attempts}` +
-          ` · min conf ${(reading.minConfidence * 100).toFixed(0)}%` +
-          ` · ${elapsed} ms` +
-          (lowRes ? ' · preview snapshot' : ''),
-      );
-      if (reading.raw) {
-        parts.push(reading.raw);
-      }
-    }
-    return parts.join('\n');
-  }, [model, reading, elapsed, lowRes]);
 
   if (!hasPermission) {
     return (
@@ -358,7 +338,6 @@ export default function ScanScreen() {
             note={note}
             busy={busy}
             warn={!!reading && reading.ok && reading.minConfidence < LOW_CONFIDENCE}
-            debug={debug}
           />
         </View>
 

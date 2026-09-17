@@ -147,6 +147,24 @@ describe('parseMicr', () => {
     expect(result.fields?.account_number).toBe('12345678');
   });
 
+  it('rejects a line cut short, even though it parses and checksums', () => {
+    // A real capture whose band lost its right-hand boxes came back as a valid
+    // auxiliary field, a valid ABA routing number, and a one-digit account --
+    // `5` where the truth was `586033512335`. Nothing else catches this: the
+    // checksum covers only the routing number, and the glyphs that survived
+    // were classified confidently.
+    const result = parseMicr('O013708OT113000023T5');
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/cut short/);
+    expect(result.fields).toBeUndefined();
+  });
+
+  it('accepts the shortest account numbers that really occur', () => {
+    // chk002 and chk009 are the shortest in the sample set, at 8 digits.
+    expect(parseMicr('O083238OT084201278T14084933O').ok).toBe(true);
+    expect(parseMicr('O2307OT000000000T77715458O').ok).toBe(true);
+  });
+
   it('pulls out the amount field when one is printed', () => {
     const result = parseMicr('T122000661T 000123456789O A000012345A');
     expect(result.ok).toBe(true);
@@ -589,6 +607,127 @@ describe('missing-digit detection', () => {
   it('ignores a gap next to a symbol, which is a real field separator', () => {
     expect(hasMissingDigits('12T34', [1, 2, 1, 1])).toBe(false);
     expect(hasMissingDigits('12O34', [1, 1, 2, 1])).toBe(false);
+  });
+});
+
+describe('symbol repair', () => {
+  // The four E-13B symbols are drawn from separate strokes, and a soft or
+  // tilted crop blurs them into each other. They also carry the line's whole
+  // structure, so one wrong symbol invalidates an otherwise perfect read.
+
+  it('recovers a transit misread as a dash', () => {
+    // A real tilted capture. Every character is right except the first transit,
+    // which came back as a dash -- at over 0.90 confidence, so no confidence
+    // threshold would have caught it. Structure does: a MICR line carries
+    // exactly two transit symbols, and the promoted reading still has to
+    // satisfy the ABA checksum on the nine digits it exposes.
+    const broken = 'O00279106OD062206295T5500272066O';
+    const fixed = 'O00279106OT062206295T5500272066O';
+    expect(parseMicr(broken).ok).toBe(false);
+
+    const repaired = parseMicr(fixed);
+    expect(repaired.ok).toBe(true);
+    expect(repaired.fields?.routing_number).toBe('062206295');
+    expect(repaired.fields?.account_number).toBe('5500272066');
+  });
+
+  it('will not promote a symbol into a routing number that fails the checksum', () => {
+    // The same shape, one routing digit different. Promoting the dash here
+    // yields a structurally valid line whose checksum does not hold, so it has
+    // to stay rejected -- this is what keeps the repair from inventing reads.
+    expect(parseMicr('O00279106OT062206294T5500272066O').ok).toBe(false);
+  });
+});
+
+describe('field gaps', () => {
+  // A MICR line is not evenly spaced. The gap between the transit field and the
+  // on-us field runs wider than the character pitch, and an earlier version
+  // treated any gap over 2 pitches as the end of the line -- so it kept the
+  // longest run of glyphs and threw the rest away. On a real capture that meant
+  // silently discarding the entire account field.
+
+  /** Two groups of bars separated by `gapPitches` of blank paper. */
+  const twoFields = (left: number, right: number, gapPitches: number): GrayImage => {
+    const pitch = 20;
+    const barWidth = 10;
+    const height = 40;
+    const margin = pitch;
+    const gapStart = margin + left * pitch;
+    const rightStart = gapStart + Math.round(gapPitches * pitch);
+    const total = rightStart + right * pitch + margin;
+    const image: GrayImage = {
+      data: new Uint8Array(total * height).fill(235),
+      width: total,
+      height,
+    };
+    const paint = (x0: number) => {
+      for (let y = 4; y < height - 4; y++) {
+        for (let x = x0; x < x0 + barWidth && x < total; x++) {
+          image.data[y * total + x] = 20;
+        }
+      }
+    };
+    for (let i = 0; i < left; i++) {
+      paint(margin + i * pitch);
+    }
+    for (let i = 0; i < right; i++) {
+      paint(rightStart + i * pitch);
+    }
+    return image;
+  };
+
+  it('keeps both fields across a gap wider than the neighbour threshold', () => {
+    // 2.21 pitches is what the failing capture actually measured ahead of its
+    // account field -- above the 2.0 neighbour threshold, and entirely legitimate.
+    const band = twoFields(18, 11, 2.21);
+    const boxes = findGlyphBoxes(inkMask(band, 'otsu'), DEFAULT_CONFIG);
+    expect(boxes).toHaveLength(29);
+  });
+
+  it('still drops an isolated speck beyond the line', () => {
+    // The rule keeps substantial fields, not everything: a stray mark short of
+    // MIN_CHAIN_GLYPHS at the edge is still noise and still goes.
+    const band = twoFields(24, 2, 4);
+    const boxes = findGlyphBoxes(inkMask(band, 'otsu'), DEFAULT_CONFIG);
+    expect(boxes).toHaveLength(24);
+  });
+});
+
+describe('truncated lines', () => {
+  // The most dangerous failure this scanner has. When the band search trims
+  // boxes off the right of a line, the account loses its tail; everything left
+  // behind is well formed and confidently classified, and the ABA checksum
+  // covers only the routing number, so nothing downstream can tell. A rejected
+  // scan costs a retry. An accepted short one pays the wrong account.
+
+  it('rejects an account field left open by a cut line', () => {
+    // chk007, segmented to 25 of its 28 glyphs. Checksum-valid, structurally
+    // clean, and wrong by two digits -- it read as a 7-digit account where the
+    // truth is 9. The tell is the missing on-us symbol: the field never closed.
+    const truth = 'O40458OT000000518T572859650O';
+    const cut = 'O40458OT000000518T5728596';
+
+    expect(parseMicr(truth).ok).toBe(true);
+    expect(parseMicr(truth).fields?.account_number).toBe('572859650');
+
+    const result = parseMicr(cut);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/cut short/);
+  });
+
+  it('still accepts the layout where the cheque number trails the account', () => {
+    // The account here is closed by the on-us symbol and followed by another
+    // field, so the rule above must not fire. This is the personal-cheque
+    // layout, and rejecting it would cost real coverage.
+    const result = parseMicr('T111000614T687808910O8241');
+    expect(result.ok).toBe(true);
+    expect(result.fields?.account_number).toBe('687808910');
+    expect(result.fields?.check_number).toBe('8241');
+  });
+
+  it('rejects a line cut down to a single account digit', () => {
+    // chk003 came back like this: one digit in place of twelve.
+    expect(parseMicr('O013708OT113000023T5O').ok).toBe(false);
   });
 });
 

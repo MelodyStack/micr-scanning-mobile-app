@@ -1,11 +1,18 @@
 /**
  * Framing guide and status line.
  *
- * The rule this follows, learned the hard way: **nothing is drawn over the
- * cheque**. An earlier version put a dashed box and the caption "NUMBER LINE"
- * right where the MICR band sits, which is the one part of the cheque the user
- * needs to see well enough to line up. The band indicator is now a pair of
- * ticks outside the frame, and the controls live in their own bar below it.
+ * Two rules, both learned from testing against real cheques:
+ *
+ *  1. **Nothing is drawn over the number line.** An early version put a dashed
+ *     box and the caption "NUMBER LINE" exactly where the MICR band falls --
+ *     the one part of the cheque the user has to see to line it up.
+ *  2. **But it still has to say where the numbers go.** Removing the marker
+ *     entirely left the user guessing.
+ *
+ * So the band is *bracketed*, never covered: a red line above it and another
+ * below, with the row between them left completely clear. White marks the
+ * cheque's edges, red means "put the numbers here" -- two colours, one job
+ * each.
  *
  * The outline is an aiming aid, nothing more. Recognition searches the whole
  * photo and finds the band itself, so no coordinate ever crosses between screen
@@ -23,11 +30,9 @@ interface Props {
   busy: boolean;
   /** The read passed its checksum but carried an unsure glyph. */
   warn?: boolean;
-  /** Dev-only readout of what the reader actually saw. */
-  debug?: string;
 }
 
-export default function ScanOverlay({ note, busy, warn, debug }: Props) {
+export default function ScanOverlay({ note, busy, warn }: Props) {
   return (
     <View style={styles.root} pointerEvents="none">
       <View style={styles.header}>
@@ -40,10 +45,9 @@ export default function ScanOverlay({ note, busy, warn, debug }: Props) {
           </Text>
         ) : (
           <Text style={styles.sub}>
-            Nothing is sent until the read passes its checksum
+            Keep the number row between the red lines
           </Text>
         )}
-        {!!debug && <Text style={styles.debug}>{debug}</Text>}
       </View>
 
       <View style={styles.centre}>
@@ -53,10 +57,15 @@ export default function ScanOverlay({ note, busy, warn, debug }: Props) {
           <Corner style={styles.bl} />
           <Corner style={styles.br} />
 
-          {/* Where the band sits, marked from outside the frame so the print
-              underneath stays legible. */}
-          <View style={[styles.bandTick, styles.bandTickLeft]} />
-          <View style={[styles.bandTick, styles.bandTickRight]} />
+          {/* The band goes between these. Nothing is drawn across the row
+              itself, so the printed characters stay fully legible. */}
+          <View style={styles.bandTop} />
+          <View style={styles.bandBottom} />
+
+          {/* End markers, so the zone still reads as a band and not as two
+              unrelated rules. */}
+          <View style={[styles.bandEnd, styles.bandEndLeft]} />
+          <View style={[styles.bandEnd, styles.bandEndRight]} />
         </View>
       </View>
     </View>
@@ -67,9 +76,17 @@ function Corner({ style }: { style: object }) {
   return <View style={[styles.corner, style]} />;
 }
 
-// White, not a colour. A cheque is cream paper with dark ink and often a
-// pastel security tint, and the previous green sat right on top of that range.
-const GUIDE = '#ffffff';
+// White for the sheet, red for the band. A cheque is cream paper with dark ink
+// and often a pastel security tint; green sat inside that range and disappeared
+// into it, which is why this is not green any more.
+const SHEET = '#ffffff';
+const BAND = '#ff3b30';
+
+// A MICR band sits in the bottom 5/8 inch of a 2.75 inch cheque, and the
+// characters themselves occupy roughly 84% to 91% of its height. The brackets
+// are set a little outside that so the row has room to breathe.
+const BAND_TOP = '79%';
+const BAND_BOTTOM = '4%';
 
 const styles = StyleSheet.create({
   root: { flex: 1 },
@@ -89,35 +106,41 @@ const styles = StyleSheet.create({
     maxHeight: '88%',
   },
 
-  corner: { position: 'absolute', width: 30, height: 30, borderColor: GUIDE },
+  corner: { position: 'absolute', width: 30, height: 30, borderColor: SHEET },
   tl: { top: 0, left: 0, borderTopWidth: 3, borderLeftWidth: 3 },
   tr: { top: 0, right: 0, borderTopWidth: 3, borderRightWidth: 3 },
   bl: { bottom: 0, left: 0, borderBottomWidth: 3, borderLeftWidth: 3 },
   br: { bottom: 0, right: 0, borderBottomWidth: 3, borderRightWidth: 3 },
 
-  // Short ticks just outside the left and right edges, at the height the MICR
-  // band occupies on a cheque. They say "put the number line here" without
-  // covering it.
-  bandTick: {
+  bandTop: {
     position: 'absolute',
-    bottom: '9%',
-    width: 18,
+    left: 0,
+    right: 0,
+    top: BAND_TOP,
     height: 2,
-    backgroundColor: GUIDE,
-    opacity: 0.8,
+    backgroundColor: BAND,
   },
-  bandTickLeft: { left: -22 },
-  bandTickRight: { right: -22 },
+  bandBottom: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: BAND_BOTTOM,
+    height: 2,
+    backgroundColor: BAND,
+  },
+  // Short uprights joining the two lines at each end.
+  bandEnd: {
+    position: 'absolute',
+    top: BAND_TOP,
+    bottom: BAND_BOTTOM,
+    width: 2,
+    backgroundColor: BAND,
+  },
+  bandEndLeft: { left: 0 },
+  bandEndRight: { right: 0 },
 
   note: { color: '#fff', fontSize: 15, textAlign: 'center', fontWeight: '500' },
   noteBusy: { color: '#7aa2f7' },
-  sub: { color: '#9aa2b1', fontSize: 11, textAlign: 'center', marginTop: 4 },
+  sub: { color: '#ff8a80', fontSize: 11, textAlign: 'center', marginTop: 4 },
   warn: { color: '#fbbf24', fontSize: 12, textAlign: 'center', marginTop: 4 },
-  debug: {
-    color: '#93c5fd',
-    fontSize: 10,
-    fontFamily: 'monospace',
-    textAlign: 'center',
-    marginTop: 6,
-  },
 });

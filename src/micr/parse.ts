@@ -41,6 +41,25 @@ export function abaChecksumValid(routing: string): boolean {
 const MAX_ACCOUNT_DIGITS = 17;
 
 /**
+ * Shortest account number treated as a real read.
+ *
+ * A plausibility floor, and the only thing standing between a truncated line
+ * and a misrouted payment. When the band search trims boxes off the *right* of
+ * a line it amputates the account, and nothing else notices: the ABA checksum
+ * covers only the routing number, the structure still parses, and the glyphs
+ * that survive are classified confidently. One real cheque came back with a
+ * one-digit account number -- `5` in place of `586033512335` -- and was
+ * otherwise perfectly well formed.
+ *
+ * The 14 real cheques in the training repo run 8 to 12 digits, and US account
+ * numbers generally do. Six leaves room below anything realistic while still
+ * catching a line that lost most of itself. It trades coverage for safety in
+ * the direction that matters here: a rejected scan costs a retry, an accepted
+ * wrong one pays the wrong account.
+ */
+const MIN_ACCOUNT_DIGITS = 6;
+
+/**
  * Parse a substituted MICR line (T/A/O/D plus digits).
  *
  * Handles both layouts, which is the trap spec section 8 calls out: many
@@ -107,6 +126,28 @@ export function parseMicr(raw: string): ParseResult {
     return { ok: false, raw, error: 'no account number after the routing field' };
   }
 
+  // The account field has to be *closed* by an on-us symbol.
+  //
+  // This is the second half of the truncation guard, and it catches what a
+  // length floor cannot. When the band search trims boxes off the right of a
+  // line, the account loses its tail and its closing symbol together -- chk007
+  // came back as `...T5728596` for a true `...T572859650O`, which is well
+  // formed, checksum-valid, seven digits long, and wrong by two digits. Nothing
+  // downstream could tell.
+  //
+  // A digit run that just stops at the end of the line was never terminated, so
+  // there is no evidence the account ended there rather than the reading did.
+  // Either the run is followed by another field (`687808910O8241`, the layout
+  // where the cheque number trails), or the line closes on the symbol itself --
+  // every one of the 14 reference cheques does one or the other.
+  if (parts.length === 1 && !onus.endsWith('O')) {
+    return {
+      ok: false,
+      raw,
+      error: 'the account field is not closed by an on-us symbol -- the line was cut short',
+    };
+  }
+
   // The dash is a separator inside the on-us field on plenty of cheques, not a
   // digit. It is kept in `raw` for traceability and dropped from the value the
   // backend receives, which is the convention the existing web app follows.
@@ -124,6 +165,14 @@ export function parseMicr(raw: string): ParseResult {
       ok: false,
       raw,
       error: `account number is ${account.length} digits, longer than the layout allows`,
+    };
+  }
+  if (account.length < MIN_ACCOUNT_DIGITS) {
+    return {
+      ok: false,
+      raw,
+      error:
+        `account number is only ${account.length} digit(s) -- the line was cut short`,
     };
   }
   if (checkNumber !== null && !/^\d+$/.test(checkNumber)) {
