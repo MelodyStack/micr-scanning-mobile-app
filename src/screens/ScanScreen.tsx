@@ -347,43 +347,54 @@ export default function ScanScreen() {
         </Centered>
       )}
 
-      <ScanOverlay
-        note={note}
-        busy={busy}
-        warn={!!reading && reading.ok && reading.minConfidence < LOW_CONFIDENCE}
-        debug={debug}
-      />
-
-      {phase !== 'done' && (
-        <View style={styles.controls}>
-          {/* Equal side slots keep the shutter centred whether or not the
-              device has a torch to offer. */}
-          <View style={styles.side}>
-            {hasTorch && (
-              <Pressable
-                style={[styles.chip, torch && styles.chipOn]}
-                onPress={() => setTorch(t => !t)}
-              >
-                <Text style={[styles.chipText, torch && styles.chipTextOn]}>Torch</Text>
-              </Pressable>
-            )}
-          </View>
-
-          <Pressable
-            style={[styles.shutter, busy && styles.shutterBusy]}
-            onPress={capture}
-            disabled={busy || !device}
-            accessibilityLabel="Capture the cheque"
-          >
-            {busy ? (
-              <ActivityIndicator color="#000" />
-            ) : (
-              <View style={styles.shutterCore} />
-            )}
-          </Pressable>
-
+      {/* Overlay and controls are laid out as a column above the camera, so
+          the guide is centred in whatever space is left between the header and
+          the control bar. Floating the controls over the preview put the torch
+          and the shutter on top of both ends of the MICR band -- the one part
+          of the cheque the user has to be able to see. */}
+      <View style={styles.stack} pointerEvents="box-none">
+        <View style={styles.overlaySlot} pointerEvents="none">
+          <ScanOverlay
+            note={note}
+            busy={busy}
+            warn={!!reading && reading.ok && reading.minConfidence < LOW_CONFIDENCE}
+            debug={debug}
+          />
         </View>
-      )}
+
+        {phase !== 'done' && (
+          <View style={styles.controls}>
+            <View style={styles.side}>
+              {hasTorch && (
+                <Pressable
+                  style={[styles.chip, torch && styles.chipOn]}
+                  onPress={() => setTorch(t => !t)}
+                >
+                  <Text style={[styles.chipText, torch && styles.chipTextOn]}>
+                    Torch
+                  </Text>
+                </Pressable>
+              )}
+            </View>
+
+            <Pressable
+              style={[styles.shutter, busy && styles.shutterBusy]}
+              onPress={capture}
+              disabled={busy || !device}
+              accessibilityLabel="Capture the cheque"
+            >
+              {busy ? (
+                <ActivityIndicator color="#000" />
+              ) : (
+                <View style={styles.shutterCore} />
+              )}
+            </Pressable>
+
+            {/* Balances the slot on the left so the shutter stays centred. */}
+            <View style={styles.side} />
+          </View>
+        )}
+      </View>
 
       {fields && (
         <ResultCard
@@ -432,15 +443,27 @@ const styles = StyleSheet.create({
   buttonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
   link: { color: '#7aa2f7', fontSize: 14, marginTop: 4 },
 
-  controls: {
+  // Fills the screen above the camera. `box-none` so taps fall through to the
+  // preview everywhere except the controls themselves.
+  stack: {
     position: 'absolute',
+    top: 0,
     left: 0,
     right: 0,
     bottom: 0,
-    paddingBottom: 28,
+    flexDirection: 'column',
+  },
+  overlaySlot: { flex: 1 },
+
+  // A real bar with a background, not buttons floating over the preview. The
+  // cheque guide is centred in the space left above it, so the controls can
+  // never sit on top of the MICR band.
+  controls: {
+    paddingVertical: 14,
     paddingHorizontal: 24,
     flexDirection: 'row',
     alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.55)',
   },
   side: { flex: 1 },
   shutter: {

@@ -1,0 +1,47 @@
+diff --git a/node_modules/react-native-fast-tflite/android/src/main/java/com/margelo/nitro/tflite/HybridAssetLoader.kt b/node_modules/react-native-fast-tflite/android/src/main/java/com/margelo/nitro/tflite/HybridAssetLoader.kt
+index c2360f5..5f769ca 100644
+--- a/node_modules/react-native-fast-tflite/android/src/main/java/com/margelo/nitro/tflite/HybridAssetLoader.kt
++++ b/node_modules/react-native-fast-tflite/android/src/main/java/com/margelo/nitro/tflite/HybridAssetLoader.kt
+@@ -2,6 +2,7 @@ package com.margelo.nitro.tflite
+ 
+ import androidx.annotation.Keep
+ import com.facebook.proguard.annotations.DoNotStrip
++import com.margelo.nitro.NitroModules
+ import com.margelo.nitro.core.ArrayBuffer
+ import com.margelo.nitro.core.Promise
+ import java.net.URL
+@@ -9,8 +10,34 @@ import java.net.URL
+ @Keep
+ @DoNotStrip
+ class HybridAssetLoader : HybridAssetLoaderSpec() {
++  /**
++   * Upstream only did `URL(path).readBytes()`, which works in development --
++   * where Metro serves the model over http -- and fails in every release build.
++   * There, `Image.resolveAssetSource()` hands back the packaged resource name
++   * (`assets_micr_cnn_v1_fp32`), java.net.URL finds no protocol in it, and the
++   * model never loads:
++   *
++   *   java.net.MalformedURLException: no protocol: assets_micr_cnn_v1_fp32
++   *
++   * Metro puts non-image assets into res/raw, so look there first and only fall
++   * back to treating the path as a URL. This is what @shopify/react-native-skia
++   * does in its own asset loader.
++   */
+   override fun loadAsset(path: String): Promise<ArrayBuffer> {
+     return Promise.async {
++      val context = NitroModules.applicationContext
++      if (context != null) {
++        val resources = context.resources
++        val name = path.substringAfterLast('/').substringBeforeLast('.')
++        var id = resources.getIdentifier(name, "raw", context.packageName)
++        if (id == 0) {
++          id = resources.getIdentifier(name, "drawable", context.packageName)
++        }
++        if (id != 0) {
++          val bytes = resources.openRawResource(id).use { it.readBytes() }
++          return@async ArrayBuffer.copy(bytes)
++        }
++      }
+       val bytes = URL(path).readBytes()
+       return@async ArrayBuffer.copy(bytes)
+     }

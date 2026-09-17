@@ -92,15 +92,42 @@ android {
             keyAlias 'androiddebugkey'
             keyPassword 'android'
         }
+        // Credentials come from ~/.gradle/gradle.properties so that neither the
+        // keystore nor its passwords can end up in the repository. Without them
+        // this config is skipped and the release build stays debug-signed --
+        // which installs fine but cannot be published or updated.
+        if (project.hasProperty('MICR_STORE_FILE')) {
+            release {
+                storeFile file(MICR_STORE_FILE)
+                storePassword MICR_STORE_PASSWORD
+                keyAlias MICR_KEY_ALIAS
+                keyPassword MICR_KEY_PASSWORD
+            }
+        }
+    }
+
+    // One APK per architecture. Skia alone is ~34 MB of native code per ABI, so
+    // a universal APK carrying all four comes to roughly 250 MB. x86 builds are
+    // emulator-only and are left out; add them back if you need to install a
+    // release build on one.
+    splits {
+        abi {
+            enable true
+            reset()
+            // Override for a one-off build, e.g. an emulator check:
+            //   ./gradlew assembleRelease -PMICR_ABIS=x86_64
+            include(*((project.findProperty('MICR_ABIS') ?: 'arm64-v8a,armeabi-v7a').split(',')))
+            universalApk false
+        }
     }
     buildTypes {
         debug {
             signingConfig signingConfigs.debug
         }
         release {
-            // Caution! In production, you need to generate your own keystore file.
-            // see https://reactnative.dev/docs/signed-apk-android.
-            signingConfig signingConfigs.debug
+            signingConfig project.hasProperty('MICR_STORE_FILE')
+                ? signingConfigs.release
+                : signingConfigs.debug
             minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
         }
