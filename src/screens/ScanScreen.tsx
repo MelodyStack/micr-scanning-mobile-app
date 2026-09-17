@@ -1,17 +1,25 @@
 /**
- * The one screen: point the camera at a check, get validated fields back.
+ * The one screen: frame a cheque, tap, get validated fields back.
  *
- * The guide rectangle is doing real work, not decoration. It constrains the
- * user to put the MICR band in a known place at a known scale, which removes
- * document detection, perspective correction and orientation from the runtime
- * problem entirely -- the three things that are hardest on a handheld photo.
+ * Tap-to-capture rather than a live frame processor, for two reasons that both
+ * turned out to matter more than the convenience of continuous scanning:
+ *
+ *  * Resolution. A still is 4032x3024, which is ~90 px per MICR glyph. A video
+ *    frame processed at 960 px gives ~30, and the model was trained on crops
+ *    cut from full-resolution photos.
+ *  * Frame processors on VisionCamera v4 require react-native-worklets-core,
+ *    which has no build for this React Native version. It fails to link
+ *    `__cxa_init_primary_exception` and takes the process down during
+ *    TurboModule init -- before any JavaScript runs at all.
+ *
+ * So there are no worklets anywhere in this app. Capture is a promise, decoding
+ * is Skia, and recognition is ordinary TypeScript on the JS thread.
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Linking,
-  Platform,
   Pressable,
   StyleSheet,
   Text,
@@ -20,86 +28,75 @@ import {
 import {
   Camera,
   useCameraDevice,
+  useCameraFormat,
   useCameraPermission,
-  useFrameProcessor,
 } from 'react-native-vision-camera';
-import { useResizePlugin } from 'vision-camera-resize-plugin';
-import { loadTensorflowModel, TensorflowModel } from 'react-native-fast-tflite';
-import { useRunOnJS, useSharedValue } from 'react-native-worklets-core';
+import { loadTensorflowModel, type TfliteModel } from 'react-native-fast-tflite';
 
-import { FrameVoter, recognizeDocument } from '../micr/recognize';
-import { MicrFields } from '../micr/parse';
+import { decodePyramid } from '../micr/decode';
+import type { MicrFields } from '../micr/parse';
+import {
+  checkModelContract,
+  describeModel,
+  LOW_CONFIDENCE,
+  type Recognition,
+  recognizeCheque,
+} from '../micr/recognize';
 import ResultCard from '../components/ResultCard';
 import ScanOverlay from '../components/ScanOverlay';
 
 /**
- * Working resolution for the whole frame, in display orientation.
+ * The float32 build, named for what it is.
  *
- * The guide is 92% of this wide, so a 30-glyph MICR line lands at roughly 30 px
- * per character -- comfortably above what the segmenter needs to separate
- * them, without making the per-frame luminance pass expensive.
+ * `export/` in the training repo holds float32, fp16 and int8 builds of the
+ * same weights. This app previously bundled the int8 one under the plain
+ * `micr_cnn_v1.tflite` name, so nothing on disk said which was shipping and
+ * copying the fp32 export over it would have silently swapped models. The int8
+ * build measures 99.67% argmax parity against PyTorch versus 100% for float32,
+ * and the difference costs 350 KB of APK -- not a trade worth making when the
+ * whole design leans on reads being right.
  */
-const WORK_WIDTH = 960;
+const MODEL = require('../../assets/micr_cnn_v1_fp32.tflite');
+
+type Phase = 'loading' | 'ready' | 'working' | 'done' | 'error';
 
 /**
- * How the sensor frame has to be turned to match what the preview draws.
+ * Step markers, dev builds only.
  *
- * Sensor mounting differs by device, so the same code can come out upright on
- * one phone and mirrored or upside down on another. A mirrored frame is the
- * nastiest of those: the glyphs still segment, the model still classifies, and
- * the line assembles backwards -- so it fails the checksum with no hint as to
- * why. Tapping the preview cycles these, and the readout shows which is
- * active, so the right one can be found on the device in a few seconds rather
- * than guessed at from here.
+ * A read is several seconds of native decode plus several of JS. When one of
+ * those stalls the screen just sits there, and from the outside a hang in Skia
+ * looks identical to a slow segmentation. These are what tell the two apart.
  */
-export const ORIENTATIONS: ('auto' | '0deg' | '90deg' | '180deg' | '270deg')[] = [
-  'auto',
-  '90deg',
-  '270deg',
-  '180deg',
-  '0deg',
-];
-
-type Status = 'loading' | 'scanning' | 'done' | 'error';
+function trace(message: string): void {
+  if (__DEV__) {
+    console.log(`[scanner] ${message}`);
+  }
+}
 
 export default function ScanScreen() {
   const { hasPermission, requestPermission } = useCameraPermission();
   const device = useCameraDevice('back');
-  const { resize } = useResizePlugin();
+  // The largest photo the sensor offers. Every extra pixel across the band is
+  // one the segmenter does not have to invent.
+  const format = useCameraFormat(device, [{ photoResolution: 'max' }]);
+  // The camera LED. Lighting is the biggest lever on whether a band segments
+  // cleanly, so it earns its place on real hardware -- but emulators have no
+  // LED, and asking CameraX for a flash that does not exist throws
+  // FlashUnavailableError straight out of takePhoto.
+  const hasTorch = device?.hasTorch ?? false;
 
-  const [model, setModel] = useState<TensorflowModel | null>(null);
-  const [status, setStatus] = useState<Status>('loading');
+  const camera = useRef<Camera>(null);
+  const [model, setModel] = useState<TfliteModel | null>(null);
+  const [phase, setPhase] = useState<Phase>('loading');
   const [fields, setFields] = useState<MicrFields | null>(null);
-  const [hint, setHint] = useState('Fit the whole cheque in the frame');
+  const [reading, setReading] = useState<Recognition | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // Shown only in dev builds. Guessing at frame geometry from the outside cost
-  // a whole debugging round; this makes it visible on the device.
-  const [debug, setDebug] = useState('');
-
-  const voter = useRef(new FrameVoter(2));
-  const busy = useRef(false);
-  // Shared with the camera thread: a ref is not visible from a worklet, so
-  // without this the processor would pile up frames faster than they are read.
-  const busyShared = useSharedValue(false);
-  // Primitives, not an index into a module-level array. A worklet only sees
-  // values captured into its closure; reaching for a module object from inside
-  // one leaves it undefined, and the resulting throw was being swallowed by the
-  // catch below -- the processor span forever without ever calling onBand, so
-  // the readout simply went blank.
-  const rotationShared =
-    useSharedValue<'auto' | '0deg' | '90deg' | '180deg' | '270deg'>('auto');
-  const modeIndex = useRef(0);
-
-  const cycleOrientation = useCallback(() => {
-    modeIndex.current = (modeIndex.current + 1) % ORIENTATIONS.length;
-    rotationShared.value = ORIENTATIONS[modeIndex.current];
-    voter.current.reset();
-  }, [rotationShared]);
-  // Same reason in reverse -- the worklet closure would capture a stale status.
-  const statusRef = useRef<Status>('loading');
-  useEffect(() => {
-    statusRef.current = status;
-  }, [status]);
+  const [torch, setTorch] = useState(false);
+  const [note, setNote] = useState('Fill the frame with the cheque, then tap');
+  const [elapsed, setElapsed] = useState(0);
+  // True when the capture came from the preview snapshot rather than the sensor.
+  const [lowRes, setLowRes] = useState(false);
+  const lowResRef = useRef(false);
 
   useEffect(() => {
     if (!hasPermission) {
@@ -111,26 +108,34 @@ export default function ScanScreen() {
     let cancelled = false;
 
     /**
-     * Load on CPU, and only then try to upgrade to a hardware delegate.
+     * Load on CPU first, then try to upgrade to a hardware delegate.
      *
-     * NNAPI is absent or broken on plenty of devices -- emulators especially --
-     * and asking for it up front takes the whole app down rather than falling
-     * back. The model is 123k parameters on a 48x32 crop, so CPU is perfectly
-     * fast; the delegate is a bonus, never a requirement.
+     * NNAPI is missing or broken on plenty of devices, emulators especially,
+     * and asking for it up front takes the whole app down instead of falling
+     * back. The model is 123k parameters on a 48x32 crop, so the CPU is
+     * perfectly quick; the delegate is a bonus, never a requirement.
      */
-    const asset = require('../../assets/micr_cnn_v1.tflite');
-    loadTensorflowModel(asset, [])
+    loadTensorflowModel(MODEL, [])
       .then(loaded => {
         if (cancelled) {
           return;
         }
+        // Worth checking every launch: export/ holds a float32, an fp16 and an
+        // int8 build, and the app bundles one of them under a name that does
+        // not say which. The wrong file returns confident nonsense that the
+        // checksum rejects with no clue why.
+        const mismatch = checkModelContract(loaded);
+        if (mismatch) {
+          setError(mismatch);
+          setPhase('error');
+          return;
+        }
         setModel(loaded);
-        setStatus('scanning');
-        // Opportunistic upgrade. If it throws, we keep the CPU model already
-        // running and the user never notices.
-        loadTensorflowModel(asset, ['nnapi'])
+        setPhase('ready');
+
+        loadTensorflowModel(MODEL, ['nnapi'])
           .then(accelerated => {
-            if (!cancelled) {
+            if (!cancelled && !checkModelContract(accelerated)) {
               setModel(accelerated);
             }
           })
@@ -139,227 +144,282 @@ export default function ScanScreen() {
       .catch(e => {
         if (!cancelled) {
           setError(`Could not load the model: ${e?.message ?? e}`);
-          setStatus('error');
+          setPhase('error');
         }
       });
+
     return () => {
       cancelled = true;
     };
   }, []);
 
-  /**
-   * Recognition runs here, on the JS thread, not in the worklet.
-   *
-   * The frame processor only does what genuinely needs the Frame object --
-   * crop and greyscale -- then hands over a 48 KB buffer. Segmentation and
-   * inference are ordinary code that way: no 'worklet' directives threaded
-   * through the whole pipeline, and the same functions the unit tests cover.
-   */
-  const onFrame = useRunOnJS(
-    (
-      grey: Uint8Array,
-      width: number,
-      height: number,
-      fw: number,
-      fh: number,
-      rotation: string,
-    ) => {
-      if (!model || statusRef.current !== 'scanning') {
-        busy.current = false;
+  const read = useCallback(
+    async (load: () => Promise<Awaited<ReturnType<typeof decodePyramid>>>) => {
+      if (!model) {
         return;
       }
+      setPhase('working');
+      setNote('Reading the number line…');
+      const started = Date.now();
       try {
-        const result = recognizeDocument(model, { data: grey, width, height });
-        setDebug(
-          `${fw}x${fh} ${rotation} · glyphs ${result.glyphCount}` +
-            (result.mirrored ? ' · mirrored' : '') +
-            (result.raw ? `\n${result.raw}` : ''),
+        // Decoding is native and quick; recognition is a second or two of plain
+        // JavaScript. Yielding first lets the spinner actually paint.
+        trace('decode: start');
+        const pyramid = await load();
+        trace(
+          `decode: done work=${pyramid.work.width}x${pyramid.work.height} ` +
+            `scout=${pyramid.scout.width}x${pyramid.scout.height} ` +
+            `probe=${pyramid.probe.width}x${pyramid.probe.height}`,
         );
+        await new Promise(resolve => setTimeout(resolve, 0));
 
-        if (!result.ok) {
-          setHint(
-            result.glyphCount === 0
-              ? 'Show the whole cheque, number line included'
-              : result.error ?? 'Hold steady',
-          );
+        trace('recognize: start');
+        const result = recognizeCheque(model, pyramid);
+        trace(`recognize: done ok=${result.ok} glyphs=${result.glyphCount}`);
+        setElapsed(Date.now() - started);
+        setReading(result);
+
+        if (result.ok && result.fields) {
+          setFields(result.fields);
+          setNote('Read and checksummed');
+          setPhase('done');
           return;
         }
-
-        const agreed = voter.current.push(result);
-        if (agreed?.fields) {
-          setFields(agreed.fields);
-          setStatus('done');
-        } else {
-          setHint('Almost — hold steady');
-        }
-      } finally {
-        busy.current = false;
+        setFields(null);
+        setPhase('ready');
+        setNote(hintFor(result, lowResRef.current));
+      } catch (e: any) {
+        trace(`read: threw ${e?.message ?? e}`);
+        setFields(null);
+        setPhase('ready');
+        setNote(`Could not read that photo: ${e?.message ?? e}`);
       }
     },
     [model],
   );
 
-  const onWorkletError = useRunOnJS((message: string) => {
-    setDebug(`frame processor error: ${message}`);
-  }, []);
-
-  const frameProcessor = useFrameProcessor(
-    frame => {
-      'worklet';
-      if (busyShared.value) {
-        return;
-      }
-      busyShared.value = true;
-
+  /**
+   * Full-resolution capture, falling back to a preview snapshot.
+   *
+   * `takePhoto` is the one worth having: it is the full sensor frame, and
+   * pixels across the MICR band are the whole reason this app captures stills
+   * rather than video frames.
+   *
+   * But CameraX finishes every photo by writing EXIF orientation back into the
+   * file, and `ExifInterface` rejects anything it cannot parse as JPEG/PNG/WebP.
+   * Emulators with a virtual camera -- LDPlayer among them -- produce exactly
+   * that, so the capture succeeds, the bytes reach disk, and then the whole
+   * thing is thrown away over a metadata write:
+   *
+   *   androidx.camera.core.ImageCaptureException: Failed to update Exif data
+   *   Caused by: java.io.IOException: ExifInterface only supports saving
+   *     attributes on JPEG, PNG, or WebP formats.
+   *
+   * `takeSnapshot` grabs the preview view's bitmap and compresses it itself, so
+   * it never goes near ExifInterface. It is limited to the size of the preview
+   * on screen, which is a real loss of resolution -- hence second choice, not
+   * first -- but it is the difference between a usable scanner and a dead
+   * button on a virtual device.
+   */
+  const capture = useCallback(async () => {
+    const device_ = camera.current;
+    if (!device_) {
+      return;
+    }
+    try {
+      let path: string;
+      let degraded = false;
       try {
-        // Rotate the frame to display orientation, keeping its aspect ratio,
-        // then crop the guide out of the region the preview is actually
-        // showing.
-        // 'auto' until the user overrides by tapping. The screen is locked to
-        // landscape, so a portrait sensor frame always needs a quarter turn --
-        // without it the cheque sits sideways in the work image, the MICR band
-        // runs vertically, and a search that scans rows finds nothing at all.
-        const requested = rotationShared.value;
-        const rotation =
-          requested === 'auto'
-            ? frame.height > frame.width
-              ? '90deg'
-              : '0deg'
-            : requested;
-        const quarterTurn = rotation === '90deg' || rotation === '270deg';
-        // A quarter turn swaps the axes, so the output aspect flips with it.
-        const srcW = quarterTurn ? frame.height : frame.width;
-        const srcH = quarterTurn ? frame.width : frame.height;
-
-        const workW = WORK_WIDTH;
-        const workH = Math.max(2, Math.round((workW * srcH) / srcW));
-
-        const full = resize(frame, {
-          scale: { width: workW, height: workH },
-          rotation,
-          pixelFormat: 'rgb',
-          dataType: 'uint8',
+        const photo = await device_.takePhoto({
+          flash: torch && hasTorch ? 'on' : 'off',
+          enableShutterSound: false,
         });
-
-        // Whole frame to luminance (ITU-R 601 weights). No crop: recognition
-        // locates the band itself, so there is nothing to map between preview
-        // and sensor coordinates and nothing for the user to line up.
-        const grey = new Uint8Array(workW * workH);
-        for (let i = 0, p = 0; i < grey.length; i++, p += 3) {
-          grey[i] = (full[p] * 77 + full[p + 1] * 150 + full[p + 2] * 29) >> 8;
-        }
-
-        onFrame(grey, workW, workH, srcW, srcH, rotation).then(() => {
-          busyShared.value = false;
-        });
-      } catch (e: any) {
-        // Never swallow this. A silent catch here already hid one bug for a
-        // whole round: the processor threw on every frame, reset itself, and
-        // looked exactly like a camera that was simply not seeing anything.
-        onWorkletError(String(e?.message ?? e));
-        busyShared.value = false;
+        path = photo.path;
+      } catch (photoError: any) {
+        const snapshot = await device_.takeSnapshot({ quality: 100 });
+        path = snapshot.path;
+        degraded = true;
+        trace(`capture: snapshot at ${path}`);
+        console.warn(
+          '[scanner] takePhoto failed, fell back to a preview snapshot:',
+          photoError?.message ?? photoError,
+        );
       }
-    },
-    [
-      onFrame, onWorkletError, resize, busyShared, rotationShared,
-    ],
-  );
+      lowResRef.current = degraded;
+      setLowRes(degraded);
+      await read(() => decodePyramid(path));
+    } catch (e: any) {
+      setPhase('ready');
+      setNote(`Capture failed: ${e?.message ?? e}`);
+    }
+  }, [read, torch, hasTorch]);
 
-  const reset = useCallback(() => {
-    voter.current.reset();
+  const rescan = useCallback(() => {
     setFields(null);
-    setHint('Hold the check so the number line fills the box');
-    setStatus('scanning');
+    setReading(null);
+    setPhase('ready');
+    setNote('Fill the frame with the cheque, then tap');
   }, []);
 
-  const body = useMemo(() => {
-    if (!hasPermission) {
-      return (
-        <Centered>
-          <Text style={styles.title}>Camera access needed</Text>
-          <Text style={styles.body}>
-            The scanner reads the number line printed along the bottom of a
-            cheque. Nothing leaves the device until a read passes its checksum.
-          </Text>
-          <Pressable style={styles.button} onPress={() => requestPermission()}>
-            <Text style={styles.buttonText}>Allow camera</Text>
-          </Pressable>
-          <Pressable onPress={() => Linking.openSettings()}>
-            <Text style={styles.link}>Open settings</Text>
-          </Pressable>
-        </Centered>
-      );
+  const debug = useMemo(() => {
+    if (!__DEV__) {
+      return '';
     }
-
-    if (status === 'error') {
-      return (
-        <Centered>
-          <Text style={styles.title}>Scanner unavailable</Text>
-          <Text style={styles.body}>{error}</Text>
-        </Centered>
-      );
+    const parts: string[] = [];
+    if (model) {
+      parts.push(describeModel(model));
     }
-
-    if (!device || status === 'loading') {
-      return (
-        <Centered>
-          <ActivityIndicator color="#fff" />
-          <Text style={styles.body}>
-            {device ? 'Loading the reader…' : 'No camera found'}
-          </Text>
-        </Centered>
+    if (reading) {
+      parts.push(
+        `glyphs ${reading.glyphCount} · ${reading.quarterTurns * 90}°` +
+          (reading.mirrored ? ' · mirrored' : '') +
+          ` · ${reading.threshold ?? '—'} · tried ${reading.attempts}` +
+          ` · min conf ${(reading.minConfidence * 100).toFixed(0)}%` +
+          ` · ${elapsed} ms` +
+          (lowRes ? ' · preview snapshot' : ''),
       );
+      if (reading.raw) {
+        parts.push(reading.raw);
+      }
     }
+    return parts.join('\n');
+  }, [model, reading, elapsed, lowRes]);
 
+  if (!hasPermission) {
     return (
-      <>
+      <Centered>
+        <Text style={styles.title}>Camera access needed</Text>
+        <Text style={styles.body}>
+          The scanner reads the number line printed along the bottom of a cheque.
+          Nothing leaves the device until a read passes its checksum.
+        </Text>
+        <Pressable style={styles.button} onPress={() => requestPermission()}>
+          <Text style={styles.buttonText}>Allow camera</Text>
+        </Pressable>
+        <Pressable onPress={() => Linking.openSettings()}>
+          <Text style={styles.link}>Open settings</Text>
+        </Pressable>
+      </Centered>
+    );
+  }
+
+  if (phase === 'error') {
+    return (
+      <Centered>
+        <Text style={styles.title}>Scanner unavailable</Text>
+        <Text style={styles.body}>{error}</Text>
+      </Centered>
+    );
+  }
+
+  if (phase === 'loading') {
+    return (
+      <Centered>
+        <ActivityIndicator color="#fff" />
+        <Text style={styles.body}>Loading the reader…</Text>
+      </Centered>
+    );
+  }
+
+  const busy = phase === 'working';
+
+  return (
+    <View style={styles.root}>
+      {device ? (
         <Camera
+          ref={camera}
           style={StyleSheet.absoluteFill}
           device={device}
-          isActive={status === 'scanning'}
-          frameProcessor={status === 'scanning' ? frameProcessor : undefined}
+          format={format}
+          isActive={phase !== 'done'}
+          photo
+          torch={torch && hasTorch ? 'on' : 'off'}
           enableZoomGesture={false}
-          photo={false}
-          video={false}
         />
-        <ScanOverlay
-          hint={hint}
-          active={status === 'scanning'}
-          debug={__DEV__ ? debug : ''}
-        />
-        {/* Tap anywhere to try the next sensor orientation. Sits under the
-            result sheet so it cannot swallow those buttons. */}
-        {status === 'scanning' && (
-          <Pressable
-            style={StyleSheet.absoluteFill}
-            onPress={cycleOrientation}
-            accessibilityLabel="Change camera orientation"
-          />
-        )}
-        {fields && <ResultCard fields={fields} onRescan={reset} />}
-      </>
-    );
-  }, [
-    device, error, fields, frameProcessor, hasPermission, hint,
-    requestPermission, reset, status, cycleOrientation, debug,
-  ]);
+      ) : (
+        // No camera is the emulator's normal state. The test image is the whole
+        // point of this branch: the pipeline stays exercisable without one.
+        <Centered>
+          <Text style={styles.title}>No camera on this device</Text>
+          <Text style={styles.body}>
+            Use the bundled test cheque to check the reader end to end.
+          </Text>
+        </Centered>
+      )}
 
-  return <View style={styles.root}>{body}</View>;
+      <ScanOverlay
+        note={note}
+        busy={busy}
+        warn={!!reading && reading.ok && reading.minConfidence < LOW_CONFIDENCE}
+        debug={debug}
+      />
+
+      {phase !== 'done' && (
+        <View style={styles.controls}>
+          {/* Equal side slots keep the shutter centred whether or not the
+              device has a torch to offer. */}
+          <View style={styles.side}>
+            {hasTorch && (
+              <Pressable
+                style={[styles.chip, torch && styles.chipOn]}
+                onPress={() => setTorch(t => !t)}
+              >
+                <Text style={[styles.chipText, torch && styles.chipTextOn]}>Torch</Text>
+              </Pressable>
+            )}
+          </View>
+
+          <Pressable
+            style={[styles.shutter, busy && styles.shutterBusy]}
+            onPress={capture}
+            disabled={busy || !device}
+            accessibilityLabel="Capture the cheque"
+          >
+            {busy ? (
+              <ActivityIndicator color="#000" />
+            ) : (
+              <View style={styles.shutterCore} />
+            )}
+          </Pressable>
+
+        </View>
+      )}
+
+      {fields && (
+        <ResultCard
+          fields={fields}
+          lowConfidence={!!reading && reading.minConfidence < LOW_CONFIDENCE}
+          onRescan={rescan}
+        />
+      )}
+    </View>
+  );
+}
+
+/** Turn a failed read into something the user can act on. */
+function hintFor(result: Recognition, lowRes: boolean): string {
+  const suffix = lowRes
+    ? ' (this device captured the preview, not the sensor, so the band is low-resolution)'
+    : '';
+  if (result.glyphCount === 0) {
+    return `No number line found. Fill the frame with the cheque and keep it flat.${suffix}`;
+  }
+  if (result.error?.includes('checksum')) {
+    return `Read the line but the checksum failed. Try again with more light.${suffix}`;
+  }
+  if (result.error?.includes('transit')) {
+    return `Part of the number line was missed. Move closer and keep it level.${suffix}`;
+  }
+  return result.error ?? 'Could not read it. Try again.';
 }
 
 function Centered({ children }: { children: React.ReactNode }) {
-  return <View style={styles.centered}>{children}</View>;
+  return <View style={[styles.root, styles.centered]}>{children}</View>;
 }
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#000' },
-  centered: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 32,
-    gap: 12,
-  },
+  centered: { alignItems: 'center', justifyContent: 'center', padding: 32, gap: 12 },
   title: { color: '#fff', fontSize: 20, fontWeight: '600', textAlign: 'center' },
   body: { color: '#b9bec7', fontSize: 15, lineHeight: 21, textAlign: 'center' },
   button: {
@@ -371,5 +431,47 @@ const styles = StyleSheet.create({
   },
   buttonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
   link: { color: '#7aa2f7', fontSize: 14, marginTop: 4 },
-  ...(Platform.OS === 'ios' ? {} : {}),
+
+  controls: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    paddingBottom: 28,
+    paddingHorizontal: 24,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  side: { flex: 1 },
+  shutter: {
+    width: 74,
+    height: 74,
+    borderRadius: 37,
+    backgroundColor: 'rgba(255,255,255,0.28)',
+    borderWidth: 3,
+    borderColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  shutterBusy: { backgroundColor: 'rgba(255,255,255,0.85)' },
+  shutterCore: {
+    width: 58,
+    height: 58,
+    borderRadius: 29,
+    backgroundColor: '#fff',
+  },
+  chip: {
+    alignSelf: 'flex-start',
+    minWidth: 92,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 999,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(255,255,255,0.25)',
+    alignItems: 'center',
+  },
+  chipOn: { backgroundColor: '#f5d90a', borderColor: '#f5d90a' },
+  chipText: { color: '#e6e9ef', fontSize: 13, fontWeight: '600' },
+  chipTextOn: { color: '#000' },
 });

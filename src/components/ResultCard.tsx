@@ -16,13 +16,22 @@ interface Props {
   fields: MicrFields;
   onRescan: () => void;
   onConfirm?: (fields: MicrFields) => void;
+  /** Passed the checksum, but at least one glyph was read without confidence. */
+  lowConfidence?: boolean;
 }
 
-export default function ResultCard({ fields, onRescan, onConfirm }: Props) {
+export default function ResultCard({
+  fields,
+  onRescan,
+  onConfirm,
+  lowConfidence,
+}: Props) {
   return (
     <View style={styles.sheet}>
-      <View style={styles.badge}>
-        <Text style={styles.badgeText}>Checksum passed</Text>
+      <View style={[styles.badge, lowConfidence && styles.badgeWarn]}>
+        <Text style={[styles.badgeText, lowConfidence && styles.badgeTextWarn]}>
+          {lowConfidence ? 'Checksum passed — low confidence' : 'Checksum passed'}
+        </Text>
       </View>
 
       <Row label="Routing" value={fields.routing_number} />
@@ -79,7 +88,9 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     marginBottom: 14,
   },
+  badgeWarn: { backgroundColor: 'rgba(251,191,36,0.16)' },
   badgeText: { color: '#4ade80', fontSize: 12, fontWeight: '600' },
+  badgeTextWarn: { color: '#fbbf24' },
   row: {
     flexDirection: 'row',
     justifyContent: 'space-between',

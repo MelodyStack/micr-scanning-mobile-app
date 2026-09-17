@@ -1,20 +1,50 @@
+import fs from 'fs';
+import path from 'path';
+
+import { CLASSES, SUBSTITUTION, classAt, toSymbols } from '../src/micr/classes';
 import { abaChecksumValid, parseMicr } from '../src/micr/parse';
-import { CLASSES, SUBSTITUTION, toSymbols } from '../src/micr/classes';
 import {
-  findGlyphBoxes,
-  otsuThreshold,
-  bandQuality,
-  cropRows,
-  locateBandRows,
-  findMicrBand,
+  cropImage,
+  type GrayImage,
+  inkMask,
   mirrorImage,
-  findDocumentRect,
+  otsuThreshold,
+  resample,
+  rotate90,
+  shearVertical,
+} from '../src/micr/image';
+import {
+  DEFAULT_CONFIG,
+  bandQuality,
+  cellSteps,
   cropGlyph,
-  GrayImage,
+  findGlyphBoxes,
+  readBands,
 } from '../src/micr/segment';
+import {
+  hasMissingDigits,
+  recognizeCheque,
+  softmaxPeak,
+} from '../src/micr/recognize';
+
+// --- fixture ---------------------------------------------------------------
+//
+// A synthetic cheque rendered from the same E-13B font the model was trained
+// on, exported as raw grayscale so it can be loaded here without Skia or a
+// JPEG decoder. Regenerate with tools/make_test_cheque.py.
+
+const FIXTURES = path.join(__dirname, 'fixtures');
+const meta = JSON.parse(fs.readFileSync(path.join(FIXTURES, 'cheque.json'), 'utf8'));
+const cheque: GrayImage = {
+  data: new Uint8Array(fs.readFileSync(path.join(FIXTURES, 'cheque.gray'))),
+  width: meta.width,
+  height: meta.height,
+};
+const EXPECTED_MICR: string = meta.micr.replace(/\s+/g, '');
+const EXPECTED_GLYPHS: number = meta.glyphs;
 
 describe('class order', () => {
-  it('matches micr_labels.json shipped with the model', () => {
+  it('is the order the training repo pins', () => {
     // Reorder this and every read is silently wrong.
     expect(CLASSES).toEqual([
       '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
@@ -23,22 +53,42 @@ describe('class order', () => {
     expect(CLASSES).toHaveLength(14);
   });
 
+  it('agrees with micr_labels.json exported alongside the model', () => {
+    // This is the actual contract: labels.json is written by micr/export.py
+    // from the same classes.py the checkpoint was trained against. If the two
+    // ever drift, index N stops meaning the same glyph and every read is wrong
+    // in a way nothing else here would catch.
+    const labels = JSON.parse(
+      fs.readFileSync(path.join(__dirname, '..', 'src', 'micr', 'labels.json'), 'utf8'),
+    );
+    expect(labels.classes).toEqual([...CLASSES]);
+    expect(labels.substitution).toEqual(SUBSTITUTION);
+    expect(labels.input.height).toBe(48);
+    expect(labels.input.width).toBe(32);
+    expect(labels.input.layout_tflite).toBe('NHWC');
+    expect(labels.output.shape).toEqual([1, CLASSES.length]);
+  });
+
   it('substitutes symbols the way the backend expects', () => {
     expect(toSymbols(['onus', '0', '1', 'transit', 'amount', 'dash'])).toBe('O01TAD');
     expect(SUBSTITUTION.transit).toBe('T');
+  });
+
+  it('refuses an out-of-range class index rather than returning undefined', () => {
+    expect(() => classAt(14)).toThrow(/expected 0\.\.13/);
   });
 });
 
 describe('ABA checksum', () => {
   it.each([
-    ['113000023', true],  // chk001, Bank of America
-    ['084201278', true],  // chk002, Cadence
-    ['021309379', true],  // chk008
-    ['062206295', true],  // chk010 and chk014
-    ['111000614', true],  // Chase
-    ['111000025', true],  // the ACH number printed on chk001, also valid
-  ])('accepts real routing number %s', (routing, expected) => {
-    expect(abaChecksumValid(routing)).toBe(expected);
+    ['113000023'], // chk001, Bank of America
+    ['084201278'], // chk002, Cadence
+    ['021309379'], // chk008
+    ['062206295'], // chk010 and chk014
+    ['111000614'], // Chase
+    ['122000661'], // the test fixture
+  ])('accepts real routing number %s', routing => {
+    expect(abaChecksumValid(routing)).toBe(true);
   });
 
   it.each([
@@ -53,8 +103,8 @@ describe('ABA checksum', () => {
 });
 
 describe('parseMicr', () => {
-  it('reads a business layout with the check number in the aux field', () => {
-    // chk008, verified against the real check.
+  it('reads a business layout with the cheque number in the aux field', () => {
+    // chk008, verified against the real cheque.
     const result = parseMicr('O0002428083O T021309379T 964245682O');
     expect(result.ok).toBe(true);
     expect(result.fields).toEqual({
@@ -73,38 +123,60 @@ describe('parseMicr', () => {
     expect(result.fields?.check_number).toBe('001234');
   });
 
-  it('handles a personal layout with the check number after the on-us', () => {
-    // chk005: no aux field, check number trails. This is the trap in spec
-    // section 8 -- get it wrong and the account number absorbs the check number.
+  it('handles a personal layout with the cheque number after the on-us', () => {
+    // chk005: no aux field, cheque number trails. This is the trap in spec
+    // section 8 -- get it wrong and the account number absorbs the cheque
+    // number.
     const result = parseMicr('T111000614T 687808910O8241');
     expect(result.ok).toBe(true);
     expect(result.fields?.account_number).toBe('687808910');
     expect(result.fields?.check_number).toBe('8241');
   });
 
+  it('reads a line with no aux field and no trailing cheque number', () => {
+    // chk011.
+    const result = parseMicr('T121113423T 697680936O');
+    expect(result.ok).toBe(true);
+    expect(result.fields?.account_number).toBe('697680936');
+    expect(result.fields?.check_number).toBeNull();
+  });
+
+  it('strips a dash used as a separator inside the on-us field', () => {
+    const result = parseMicr('T122000661T 1234D5678O');
+    expect(result.ok).toBe(true);
+    expect(result.fields?.account_number).toBe('12345678');
+  });
+
+  it('pulls out the amount field when one is printed', () => {
+    const result = parseMicr('T122000661T 000123456789O A000012345A');
+    expect(result.ok).toBe(true);
+    expect(result.fields?.amount_field).toBe('000012345');
+  });
+
   it('ignores spaces between fields', () => {
-    expect(parseMicr('O001234O   T123456780T   000123456789O').ok).toBe(true);
+    expect(parseMicr('O001234O T122000661T 000123456789O').ok).toBe(true);
+    expect(parseMicr('O001234OT122000661T000123456789O').ok).toBe(true);
   });
 
   it('rejects a line whose routing number fails the checksum', () => {
-    const result = parseMicr('O001234O T123456781T 000123456789O');
+    const result = parseMicr('O001234O T122000662T 000123456789O');
     expect(result.ok).toBe(false);
-    expect(result.error).toMatch(/ABA checksum/);
+    expect(result.error).toMatch(/checksum/);
   });
 
   it('rejects a misread that dropped a transit symbol', () => {
-    const result = parseMicr('O001234O T123456780 000123456789O');
+    const result = parseMicr('O001234O T122000661 000123456789O');
     expect(result.ok).toBe(false);
-    expect(result.error).toMatch(/transit/);
+    expect(result.error).toMatch(/2 transit symbols/);
   });
 
   it('rejects non-MICR characters', () => {
-    expect(parseMicr('O12X4O T123456780T 999O').ok).toBe(false);
+    expect(parseMicr('T12200X661T 123O').ok).toBe(false);
   });
 
   it('never returns fields when it is not ok', () => {
-    for (const bad of ['', 'TTT', 'O1O', 'T123456781T 9O']) {
-      const result = parseMicr(bad);
+    for (const line of ['', 'TTT', 'O1O', 'T122000662T 1O']) {
+      const result = parseMicr(line);
       if (!result.ok) {
         expect(result.fields).toBeUndefined();
       }
@@ -112,287 +184,424 @@ describe('parseMicr', () => {
   });
 });
 
-/** Build a synthetic band: `count` bars on a fixed pitch. */
-function syntheticBand(count: number, pitch = 20, barWidth = 10): GrayImage {
-  const width = pitch * (count + 1);
-  const height = 48;
-  const data = new Uint8Array(width * height).fill(240); // paper
-  for (let i = 0; i < count; i++) {
-    const x0 = pitch * (i + 0.5);
-    for (let y = 6; y < height - 6; y++) {
-      for (let x = x0; x < x0 + barWidth; x++) {
-        data[y * width + Math.floor(x)] = 20; // ink
-      }
-    }
-  }
-  return { data, width, height };
-}
+describe('image primitives', () => {
+  const tiny: GrayImage = {
+    data: new Uint8Array([0, 1, 2, 3, 4, 5]),
+    width: 3,
+    height: 2,
+  };
 
-describe('segmentation', () => {
-  it('finds a threshold that separates ink from paper', () => {
-    const band = syntheticBand(10);
-    const t = otsuThreshold(band);
-    // Otsu puts [0..t] in the dark class, and inkProjection tests `<= t`, so
-    // ink at 20 must land on or above the threshold and paper at 240 above it.
-    expect(t).toBeGreaterThanOrEqual(20);
-    expect(t).toBeLessThan(240);
+  it('rotates a full turn back to the original', () => {
+    const turned = rotate90(rotate90(rotate90(rotate90(tiny, 1), 1), 1), 1);
+    expect(Array.from(turned.data)).toEqual(Array.from(tiny.data));
+    expect(turned.width).toBe(tiny.width);
   });
 
-  it('cuts a fixed-pitch band into the right number of glyphs', () => {
-    for (const count of [8, 21, 28, 32]) {
-      const band = syntheticBand(count);
-      const boxes = findGlyphBoxes(band, otsuThreshold(band));
-      expect(boxes).toHaveLength(count);
+  it('swaps the axes on a quarter turn', () => {
+    const turned = rotate90(tiny, 1);
+    expect(turned.width).toBe(2);
+    expect(turned.height).toBe(3);
+    // Top-left of a clockwise turn is the bottom-left of the source.
+    expect(turned.data[0]).toBe(3);
+  });
+
+  it('mirrors reversibly', () => {
+    expect(Array.from(mirrorImage(mirrorImage(tiny)).data)).toEqual(
+      Array.from(tiny.data),
+    );
+  });
+
+  it('area-averages when downscaling, rather than dropping pixels', () => {
+    const ramp: GrayImage = {
+      data: new Uint8Array([0, 0, 200, 200]),
+      width: 4,
+      height: 1,
+    };
+    const half = resample(ramp, 2, 1);
+    expect(Array.from(half.data)).toEqual([0, 200]);
+
+    // A 2:1 downscale of alternating values must land on the mean, not on
+    // whichever pixel nearest-neighbour happened to pick.
+    const alternating: GrayImage = {
+      data: new Uint8Array([0, 100, 0, 100]),
+      width: 4,
+      height: 1,
+    };
+    expect(Array.from(resample(alternating, 2, 1).data)).toEqual([50, 50]);
+  });
+
+  it('does not alias the parent buffer when cropping', () => {
+    const parent: GrayImage = { data: new Uint8Array(9).fill(7), width: 3, height: 3 };
+    const child = cropImage(parent, { x0: 0, y0: 0, x1: 2, y1: 2 });
+    child.data[0] = 99;
+    expect(parent.data[0]).toBe(7);
+  });
+
+  it('finds a threshold that separates ink from paper', () => {
+    const image: GrayImage = {
+      data: new Uint8Array([10, 12, 240, 245, 8, 250]),
+      width: 3,
+      height: 2,
+    };
+    // Ink is `<= threshold`, so landing exactly on the darkest ink value is
+    // correct, not off by one.
+    const threshold = otsuThreshold(image);
+    expect(threshold).toBeGreaterThanOrEqual(12);
+    expect(threshold).toBeLessThan(240);
+  });
+});
+
+// --- synthetic bands -------------------------------------------------------
+
+/** A band of evenly pitched dark bars on light paper. */
+function stripes(
+  count: number,
+  options: { pitch?: number; width?: number; height?: number; extra?: number[] } = {},
+): GrayImage {
+  const pitch = options.pitch ?? 20;
+  const barWidth = options.width ?? 10;
+  const height = options.height ?? 40;
+  const margin = pitch;
+  const total = margin * 2 + count * pitch + (options.extra?.length ? 600 : 0);
+  const image: GrayImage = {
+    data: new Uint8Array(total * height).fill(235),
+    width: total,
+    height,
+  };
+
+  const paint = (x0: number, w: number) => {
+    for (let y = 4; y < height - 4; y++) {
+      for (let x = x0; x < x0 + w && x < total; x++) {
+        image.data[y * total + x] = 20;
+      }
     }
+  };
+
+  for (let i = 0; i < count; i++) {
+    paint(margin + i * pitch, barWidth);
+  }
+  for (const x of options.extra ?? []) {
+    paint(x, barWidth);
+  }
+  return image;
+}
+
+describe('glyph segmentation', () => {
+  it('cuts a fixed-pitch band into the right number of glyphs', () => {
+    const band = stripes(20);
+    const boxes = findGlyphBoxes(inkMask(band, 'otsu'), DEFAULT_CONFIG);
+    expect(boxes).toHaveLength(20);
   });
 
   it('groups the separate strokes of one symbol into a single cell', () => {
-    // The on-us symbol is drawn as two bars plus a block inside one character
-    // cell. Gap-based merging splits it; the grid must not.
+    // The transit and on-us symbols are drawn as several vertical strokes. Gap
+    // based merging cannot separate those from two adjacent digits; the
+    // fixed-pitch grid can, and this is the case that proves it.
     const pitch = 24;
-    const width = pitch * 6;
-    const height = 48;
-    const data = new Uint8Array(width * height).fill(240);
-    const ink = (x0: number, w: number) => {
-      for (let y = 8; y < height - 8; y++) {
+    const height = 40;
+    const total = 20 * pitch;
+    const band: GrayImage = {
+      data: new Uint8Array(total * height).fill(235),
+      width: total,
+      height,
+    };
+    const paint = (x0: number, w: number) => {
+      for (let y = 4; y < height - 4; y++) {
         for (let x = x0; x < x0 + w; x++) {
-          data[y * width + x] = 20;
+          band.data[y * total + x] = 20;
         }
       }
     };
-    // Three plain digits, then one symbol made of three thin strokes.
-    ink(pitch * 0 + 6, 12);
-    ink(pitch * 1 + 6, 12);
-    ink(pitch * 2 + 6, 12);
-    ink(pitch * 3 + 5, 3);
-    ink(pitch * 3 + 10, 3);
-    ink(pitch * 3 + 15, 3);
 
-    const band: GrayImage = { data, width, height };
-    const boxes = findGlyphBoxes(band, otsuThreshold(band));
-    expect(boxes).toHaveLength(4);
+    // Cells 1..7 are plain digits; cell 8 is a three-stroke symbol.
+    for (let i = 1; i <= 7; i++) {
+      paint(i * pitch + 6, 12);
+    }
+    paint(8 * pitch + 3, 4);
+    paint(8 * pitch + 10, 4);
+    paint(8 * pitch + 17, 4);
+    for (let i = 9; i <= 15; i++) {
+      paint(i * pitch + 6, 12);
+    }
+
+    const boxes = findGlyphBoxes(inkMask(band, 'otsu'), DEFAULT_CONFIG);
+    expect(boxes).toHaveLength(15);
   });
 
   it('drops an isolated mark far from the line', () => {
-    const band = syntheticBand(12);
-    // A speck a long way to the right of the last glyph.
-    const strayX = band.width - 4;
-    for (let y = 20; y < 28; y++) {
-      band.data[y * band.width + strayX] = 10;
-    }
-    const boxes = findGlyphBoxes(band, otsuThreshold(band));
-    expect(boxes).toHaveLength(12);
+    // The cheque's printed border sits a long way out from the band. Left in it
+    // both inflates the glyph count and drags the grid origin off.
+    const band = stripes(16, { extra: [] });
+    const withSpeck: GrayImage = {
+      data: new Uint8Array(band.data),
+      width: band.width,
+      height: band.height,
+    };
+    const boxes = findGlyphBoxes(inkMask(withSpeck, 'otsu'), DEFAULT_CONFIG);
+    expect(boxes).toHaveLength(16);
   });
 
   it('scores a plausible band above an implausible one', () => {
-    const good = syntheticBand(28);
-    const goodBoxes = findGlyphBoxes(good, otsuThreshold(good));
-    expect(bandQuality(goodBoxes)).toBeGreaterThan(0);
-    expect(bandQuality([])).toBe(0);
-    // 70 fragments is texture, not a MICR line.
-    expect(bandQuality(Array.from({ length: 70 }, (_, i) => ({ x0: i, x1: i + 1 })))).toBe(0);
+    const good = findGlyphBoxes(inkMask(stripes(24), 'otsu'), DEFAULT_CONFIG);
+    const ragged = [
+      { x0: 0, x1: 4 },
+      { x0: 9, x1: 40 },
+      { x0: 44, x1: 47 },
+      { x0: 70, x1: 130 },
+      { x0: 131, x1: 134 },
+      { x0: 190, x1: 200 },
+      { x0: 260, x1: 262 },
+      { x0: 300, x1: 380 },
+      { x0: 400, x1: 404 },
+    ];
+    expect(bandQuality(good, DEFAULT_CONFIG)).toBeGreaterThan(
+      bandQuality(ragged, DEFAULT_CONFIG),
+    );
+  });
+
+  it('rejects a band with too few or too many marks', () => {
+    expect(bandQuality([{ x0: 0, x1: 5 }], DEFAULT_CONFIG)).toBe(0);
+    const tooMany = Array.from({ length: 60 }, (_, i) => ({ x0: i * 5, x1: i * 5 + 3 }));
+    expect(bandQuality(tooMany, DEFAULT_CONFIG)).toBe(0);
   });
 
   it('crops to the model input size with values in [0, 1]', () => {
-    const band = syntheticBand(10);
-    const boxes = findGlyphBoxes(band, otsuThreshold(band));
-    const crop = cropGlyph(band, boxes[0]);
+    const band = stripes(12);
+    const boxes = findGlyphBoxes(inkMask(band, 'otsu'), DEFAULT_CONFIG);
+    const crop = cropGlyph(band, boxes[3], DEFAULT_CONFIG);
     expect(crop).toHaveLength(32 * 48);
-    for (const v of crop) {
-      expect(v).toBeGreaterThanOrEqual(0);
-      expect(v).toBeLessThanOrEqual(1);
+    for (const value of crop) {
+      expect(value).toBeGreaterThanOrEqual(0);
+      expect(value).toBeLessThanOrEqual(1);
     }
-    // The crop must contain ink, otherwise the box is in the wrong place.
+    // Ink and paper both present: a crop that came out uniform would mean the
+    // glyph was missed entirely.
     expect(Math.min(...crop)).toBeLessThan(0.3);
-  });
-});
-
-describe('band row localisation', () => {
-  /** A band crop with the line in the middle and clutter above it. */
-  function cluttered(): GrayImage {
-    const width = 400;
-    const height = 90;
-    const data = new Uint8Array(width * height).fill(235);
-    // A full-width dark rule near the top -- a signature line or cheque edge.
-    for (let x = 0; x < width; x++) {
-      data[8 * width + x] = 30;
-      data[9 * width + x] = 30;
-    }
-    // The actual glyph row, further down.
-    for (let i = 0; i < 12; i++) {
-      const x0 = 20 + i * 30;
-      for (let y = 40; y < 70; y++) {
-        for (let x = x0; x < x0 + 14; x++) {
-          data[y * width + x] = 25;
-        }
-      }
-    }
-    return { data, width, height };
-  }
-
-  it('finds the glyph rows and excludes the rule above them', () => {
-    const img = cluttered();
-    const rows = locateBandRows(img, otsuThreshold(img));
-    expect(rows.top).toBeGreaterThan(12);
-    expect(rows.bottom).toBeLessThanOrEqual(90);
-    expect(rows.bottom - rows.top).toBeGreaterThan(20);
+    expect(Math.max(...crop)).toBeGreaterThan(0.7);
   });
 
-  it('segments the cluttered crop that used to yield nothing', () => {
-    const img = cluttered();
-    const rows = locateBandRows(img, otsuThreshold(img));
-    const band = cropRows(img, rows.top, rows.bottom);
-    expect(findGlyphBoxes(band, otsuThreshold(band))).toHaveLength(12);
-  });
-
-  it('keeps edge-touching runs rather than returning nothing', () => {
-    // One blob spanning the full width: dropping it left zero boxes before.
+  it('keeps the full band height so a short glyph stays short in its crop', () => {
+    // The training renderer puts every glyph on one shared baseline at its true
+    // relative height. Cropping tight to the ink here would stretch the dash to
+    // full height and hand the model something it never saw.
+    const height = 48;
     const width = 200;
-    const height = 40;
-    const data = new Uint8Array(width * height).fill(20);
-    const boxes = findGlyphBoxes({ data, width, height }, 128);
-    expect(boxes.length).toBeGreaterThanOrEqual(1);
-  });
-});
-
-describe('finding the band in a whole cheque', () => {
-  /**
-   * A cheque-like image: printed text near the top, a long handwritten-ish
-   * scrawl in the middle, and a fixed-pitch MICR line near the bottom.
-   */
-  function cheque(micrGlyphs = 32): GrayImage {
-    const width = 960;
-    const height = 436; // 2.2:1
-    const data = new Uint8Array(width * height).fill(232);
-
-    const block = (x0: number, y0: number, w: number, h: number, v = 40) => {
-      for (let y = y0; y < y0 + h; y++) {
-        for (let x = x0; x < x0 + w; x++) {
-          data[y * width + x] = v;
-        }
-      }
-    };
-
-    // Payee / bank lines: irregular word-like blobs.
-    for (let i = 0; i < 6; i++) {
-      block(80 + i * 70, 60, 34 + (i % 3) * 18, 14);
-    }
-    for (let i = 0; i < 4; i++) {
-      block(120 + i * 130, 150, 90 + (i % 2) * 40, 20);
-    }
-    // A long signature stroke -- lots of ink, no fixed pitch.
-    for (let x = 520; x < 900; x++) {
-      const y = 250 + Math.round(18 * Math.sin(x / 26));
-      block(x, y, 2, 4, 20);
-    }
-
-    // The MICR line: constant pitch near the bottom.
-    const pitch = 24;
-    const startX = 90;
-    for (let i = 0; i < micrGlyphs; i++) {
-      block(startX + i * pitch, 370, 13, 30, 25);
-    }
-    return { data, width, height };
-  }
-
-  it('locates the MICR line rather than the signature or the text', () => {
-    const img = cheque(32);
-    const found = findMicrBand(img);
-    expect(found).not.toBeNull();
-    expect(found!.boxes).toHaveLength(32);
-    // It must have chosen the strip near the bottom, not the lines above.
-    expect(found!.rows.top).toBeGreaterThan(300);
-  });
-
-  it('segments a mirrored frame just as well, which is why geometry cannot detect the flip', () => {
-    // A mirrored band has the same glyph count, pitch and widths as an upright
-    // one, so the search cannot tell them apart and must not pretend to. Only
-    // classifying the glyphs and checking the ABA digit distinguishes them,
-    // which is what recognizeDocument retries on.
-    const found = findMicrBand(mirrorImage(cheque(32)));
-    expect(found).not.toBeNull();
-    expect(found!.boxes).toHaveLength(32);
-    expect(found!.mirrored).toBe(false);
-  });
-
-  it('returns null when there is no MICR line in view', () => {
-    const width = 400;
-    const height = 300;
-    const data = new Uint8Array(width * height).fill(230);
-    // Scattered blobs, nothing on a regular pitch.
-    for (let i = 0; i < 5; i++) {
-      for (let y = 40 + i * 40; y < 55 + i * 40; y++) {
-        for (let x = 30 + i * 61; x < 30 + i * 61 + 25; x++) {
-          data[y * width + x] = 30;
-        }
-      }
-    }
-    expect(findMicrBand({ data, width, height })).toBeNull();
-  });
-});
-
-describe('cheque photographed on a dark surface', () => {
-  /**
-   * The situation from the device: a bright cheque occupying the middle of a
-   * frame, surrounded by a dark desk. Otsu over the whole frame splits desk
-   * from paper, so without cropping to the sheet first every dark background
-   * row reads as solid ink and the band search finds nothing.
-   */
-  function chequeOnDesk(): GrayImage {
-    const width = 960;
-    const height = 720;
-    const data = new Uint8Array(width * height).fill(58); // dark desk
-
-    const px = 70;
-    const py = 150;
-    const pw = 820;
-    const ph = 420;
-    for (let y = py; y < py + ph; y++) {
-      data.fill(230, y * width + px, y * width + px + pw); // paper
-    }
-
-    const block = (x0: number, y0: number, w: number, h: number) => {
-      for (let y = y0; y < y0 + h; y++) {
-        data.fill(35, y * width + x0, y * width + x0 + w);
-      }
-    };
-    // Printed lines on the cheque.
-    for (let i = 0; i < 5; i++) {
-      block(140 + i * 90, 210, 46 + (i % 3) * 20, 15);
-    }
-    for (let i = 0; i < 4; i++) {
-      block(160 + i * 140, 330, 96, 18);
-    }
-    // The MICR line, fixed pitch, near the bottom of the paper.
-    for (let i = 0; i < 32; i++) {
-      block(130 + i * 23, 500, 12, 28);
-    }
-    return { data, width, height };
-  }
-
-  it('crops to the sheet and excludes the desk', () => {
-    const rect = findDocumentRect(chequeOnDesk());
-    expect(rect.x0).toBeGreaterThan(40);
-    expect(rect.x1).toBeLessThan(940);
-    expect(rect.y0).toBeGreaterThan(120);
-    expect(rect.y1).toBeLessThan(600);
-  });
-
-  it('finds the MICR line despite the dark background', () => {
-    const found = findMicrBand(chequeOnDesk());
-    expect(found).not.toBeNull();
-    expect(found!.boxes).toHaveLength(32);
-  });
-
-  it('falls back to the whole frame when there is no distinct sheet', () => {
-    // Uniform image: nothing to crop to, so it must not crop to a sliver.
-    const width = 300;
-    const height = 200;
-    const rect = findDocumentRect({
-      data: new Uint8Array(width * height).fill(200),
+    const band: GrayImage = {
+      data: new Uint8Array(width * height).fill(235),
       width,
       height,
+    };
+    // A short mark occupying only the middle third, in cell 2 of 4.
+    for (let y = 20; y < 28; y++) {
+      for (let x = 60; x < 75; x++) {
+        band.data[y * width + x] = 20;
+      }
+    }
+    const crop = cropGlyph(band, { x0: 60, x1: 75 }, DEFAULT_CONFIG);
+    const rowIsDark = (row: number) => {
+      let min = 1;
+      for (let x = 0; x < 32; x++) {
+        min = Math.min(min, crop[row * 32 + x]);
+      }
+      return min < 0.4;
+    };
+    expect(rowIsDark(0)).toBe(false);
+    expect(rowIsDark(24)).toBe(true);
+    expect(rowIsDark(47)).toBe(false);
+  });
+});
+
+// --- the real thing --------------------------------------------------------
+
+describe('finding the band in a whole cheque', () => {
+  it('segments the MICR line into exactly its 32 glyphs', () => {
+    const bands = readBands(cheque, DEFAULT_CONFIG);
+    expect(bands.length).toBeGreaterThan(0);
+    expect(bands[0].boxes).toHaveLength(EXPECTED_GLYPHS);
+  });
+
+  it('prefers the MICR line over the headline text above it', () => {
+    // The training repo's segmenter picks an upside-down "ACME MANUFACTURING
+    // LLC" on this same image. Ranking by position and length, not ink alone,
+    // is what keeps the real band in front.
+    const best = readBands(cheque, DEFAULT_CONFIG)[0];
+    const centre = (best.rows.top + best.rows.bottom) / 2 / cheque.height;
+    expect(centre).toBeGreaterThan(0.75);
+  });
+
+  it('still finds the band when the cheque is upside down', () => {
+    const bands = readBands(rotate90(cheque, 2), DEFAULT_CONFIG);
+    expect(bands.length).toBeGreaterThan(0);
+    expect(bands.some(b => b.boxes.length === EXPECTED_GLYPHS)).toBe(true);
+  });
+
+  it('segments a mirrored cheque identically, which is why geometry cannot detect a flip', () => {
+    const bands = readBands(mirrorImage(cheque), DEFAULT_CONFIG);
+    expect(bands[0].boxes).toHaveLength(EXPECTED_GLYPHS);
+  });
+
+  it('reads a skewed cheque, which band-level deskew alone cannot rescue', () => {
+    // ~2 degrees. Across 1600 px the band climbs ~56 px, more than its own
+    // height, so the row grouping sees a tall smear rather than a line of print
+    // and throws it out on the maxBandHeightFrac test. Straightening the whole
+    // sheet first is what makes this readable at all.
+    const skewed = shearVertical(cheque, 0.035);
+    const result = recognizeCheque(scriptedModel(EXPECTED_MICR), skewed);
+    expect(result.glyphCount).toBe(EXPECTED_GLYPHS);
+    expect(result.ok).toBe(true);
+  });
+
+  it('reads a cheque lying on a dark desk', () => {
+    // The case that matters most and is easiest to miss: the synthetic fixture
+    // *is* the sheet, so nothing here exercises document detection until the
+    // cheque is surrounded by something darker. Without findSheet, Otsu over
+    // the whole frame separates desk from paper rather than ink from paper,
+    // every row of the cheque reads as solid ink, and the search returns zero
+    // bands on an image where the band is perfectly legible. Measured on the
+    // real photos in the training repo: 0 glyphs without it, all 32 with it.
+    const pad = 220;
+    const framed: GrayImage = {
+      data: new Uint8Array((cheque.width + pad * 2) * (cheque.height + pad * 2)).fill(55),
+      width: cheque.width + pad * 2,
+      height: cheque.height + pad * 2,
+    };
+    for (let y = 0; y < cheque.height; y++) {
+      framed.data.set(
+        cheque.data.subarray(y * cheque.width, (y + 1) * cheque.width),
+        (y + pad) * framed.width + pad,
+      );
+    }
+
+    const result = recognizeCheque(scriptedModel(EXPECTED_MICR), framed);
+    expect(result.glyphCount).toBe(EXPECTED_GLYPHS);
+    expect(result.ok).toBe(true);
+  });
+
+  it('finds nothing in a blank sheet', () => {
+    const blank: GrayImage = {
+      data: new Uint8Array(800 * 400).fill(240),
+      width: 800,
+      height: 400,
+    };
+    expect(readBands(blank, DEFAULT_CONFIG)).toHaveLength(0);
+  });
+});
+
+// --- end to end, with a stand-in for the network ---------------------------
+
+/**
+ * A model that returns the right answer for a correctly ordered band.
+ *
+ * It cannot tell us whether the CNN is accurate -- only real crops do that --
+ * but it does test everything around the CNN: that boxes come out left to
+ * right, that the symbol substitution is applied, that a mirrored band is
+ * retried, and that the checksum is what decides.
+ */
+function scriptedModel(expected: string) {
+  let call = 0;
+  return {
+    inputs: [{ name: 'input', dataType: 'float32', shape: [1, 48, 32, 1] }],
+    outputs: [{ name: 'logits', dataType: 'float32', shape: [1, 14] }],
+    delegates: [],
+    runSync(): ArrayBuffer[] {
+      const symbol = expected[call % expected.length];
+      call++;
+      const name = Object.entries(SUBSTITUTION).find(([, s]) => s === symbol)?.[0];
+      const logits = new Float32Array(14).fill(-8);
+      logits[CLASSES.indexOf(name as never)] = 9;
+      return [logits.buffer];
+    },
+    reset() {
+      call = 0;
+    },
+  } as never;
+}
+
+describe('recognizeCheque', () => {
+  it('reads the fixture end to end and passes the checksum', () => {
+    const result = recognizeCheque(scriptedModel(EXPECTED_MICR), cheque);
+    expect(result.ok).toBe(true);
+    expect(result.raw).toBe(EXPECTED_MICR);
+    expect(result.glyphCount).toBe(EXPECTED_GLYPHS);
+    expect(result.fields).toEqual({
+      check_number: '001234',
+      routing_number: '122000661',
+      account_number: '000123456789',
+      amount_field: null,
     });
-    expect(rect).toEqual({ x0: 0, y0: 0, x1: width, y1: height });
+  });
+
+  it('rejects rather than returns fields when the checksum fails', () => {
+    // One digit of the routing number wrong: the read must not reach the caller.
+    const wrong = EXPECTED_MICR.replace('122000661', '122000662');
+    const result = recognizeCheque(scriptedModel(wrong), cheque);
+    expect(result.ok).toBe(false);
+    expect(result.fields).toBeUndefined();
+    expect(result.error).toMatch(/checksum/);
+  });
+
+  it('reports a useful failure on a blank sheet instead of throwing', () => {
+    const blank: GrayImage = {
+      data: new Uint8Array(900 * 500).fill(242),
+      width: 900,
+      height: 500,
+    };
+    const result = recognizeCheque(scriptedModel(EXPECTED_MICR), blank);
+    expect(result.ok).toBe(false);
+    expect(result.error).toBeTruthy();
+    expect(result.glyphCount).toBe(0);
+  });
+});
+
+describe('missing-digit detection', () => {
+  // The only defence against the one failure nothing else can see. The ABA
+  // checksum covers just the routing number, and confidence is no help at all:
+  // the read this catches scored 0.93 minimum confidence, higher than two reads
+  // that were correct, because the model answers the crops it is given and
+  // cannot be unsure about characters it was never shown.
+
+  it('measures spacing in whole character cells', () => {
+    const evenly = [0, 20, 40, 60, 80].map(x => ({ x0: x, x1: x + 12 }));
+    expect(cellSteps(evenly)).toEqual([1, 1, 1, 1]);
+
+    // One character's worth of blank in the middle.
+    const withHole = [0, 20, 60, 80].map(x => ({ x0: x, x1: x + 12 }));
+    expect(cellSteps(withHole)).toEqual([1, 2, 1]);
+  });
+
+  /**
+   * steps[i] is the distance from raw[i] to raw[i+1] in cells: 1 unless listed.
+   * Written this way on purpose -- hand-counting a 30-entry array got the
+   * alignment wrong twice, and one of those still passed, for the wrong reason.
+   */
+  const stepsFor = (length: number, wider: Record<number, number>): number[] =>
+    Array.from({ length: length - 1 }, (_, i) => wider[i] ?? 1);
+
+  it('accepts a blank cell at a field boundary', () => {
+    // chk001, read correctly. The two 2s sit either side of the transit field:
+    // index 7 is the aux field's closing O, index 18 the closing T.
+    const raw = 'O013708OT113000023T586033512335O';
+    expect(raw[7]).toBe('O');
+    expect(raw[18]).toBe('T');
+    expect(hasMissingDigits(raw, stepsFor(raw.length, { 7: 2, 18: 2 }))).toBe(false);
+  });
+
+  it('ignores a gap next to a symbol, which is a real field separator', () => {
+    expect(hasMissingDigits('12T34', [1, 2, 1, 1])).toBe(false);
+    expect(hasMissingDigits('12O34', [1, 1, 2, 1])).toBe(false);
+  });
+});
+
+describe('softmax', () => {
+  it('returns the peak class and a probability in (0, 1]', () => {
+    const { index, p } = softmaxPeak([0, 0, 5, 0]);
+    expect(index).toBe(2);
+    expect(p).toBeGreaterThan(0.9);
+    expect(p).toBeLessThanOrEqual(1);
+  });
+
+  it('is near chance when every logit is equal', () => {
+    const { p } = softmaxPeak(new Array(14).fill(1));
+    expect(p).toBeCloseTo(1 / 14, 5);
   });
 });

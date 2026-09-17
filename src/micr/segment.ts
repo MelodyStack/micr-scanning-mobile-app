@@ -1,215 +1,137 @@
 /**
- * Cut a MICR band into glyph crops, in plain JS so it can run inside a
- * vision-camera frame processor worklet.
+ * Find the MICR band in a cheque photo and cut it into glyph crops.
  *
- * This is a port of micr/segment.py from the training repo. Keeping the two in
- * step matters: the model is trained on crops produced by the Python version,
- * so if this one cuts differently the model sees inputs it was never shown.
+ * A port of micr/segment.py from the training repo, and the correspondence is
+ * the point of the file. The model only ever saw crops that the Python
+ * segmenter produced; a crop cut to different proportions here is an input it
+ * was never trained on, and it will guess. Where this diverges from the Python
+ * it is marked DIVERGES and justified.
  *
- * The guided-capture overlay does the heavy lifting the Python version has to
- * do itself -- the user aligns the band inside the guide, so there is no
- * document to detect, no perspective to rectify and no orientation to work
- * out. What is left is: binarize, find boundaries, cut.
+ * Nothing here imports a native module. The whole file is exercised by
+ * __tests__/micr.test.ts on synthetic images, with no device involved.
  */
 
 import { INPUT_HEIGHT, INPUT_WIDTH } from './classes';
+import {
+  clamp,
+  closeHorizontal,
+  columnInk,
+  cropImage,
+  cropRows,
+  estimateShear,
+  type GrayImage,
+  type InkMask,
+  inkMask,
+  median,
+  otsuThreshold,
+  type Rect,
+  resample,
+  rowInk,
+  shearVertical,
+  type ThresholdMode,
+} from './image';
 
-export interface GrayImage {
-  data: Uint8Array; // row-major, one byte per pixel
-  width: number;
-  height: number;
-}
+export type { GrayImage, Rect } from './image';
 
 export interface GlyphBox {
   x0: number;
   x1: number;
 }
 
-/** Otsu's threshold. Returns the grey level that best splits ink from paper. */
-export function otsuThreshold(image: GrayImage): number {
-  const histogram = new Int32Array(256);
-  for (let i = 0; i < image.data.length; i++) {
-    histogram[image.data[i]]++;
-  }
-  const total = image.data.length;
-
-  let sum = 0;
-  for (let t = 0; t < 256; t++) {
-    sum += t * histogram[t];
-  }
-
-  let sumBackground = 0;
-  let weightBackground = 0;
-  let best = 0;
-  let bestVariance = -1;
-
-  for (let t = 0; t < 256; t++) {
-    weightBackground += histogram[t];
-    if (weightBackground === 0) {
-      continue;
-    }
-    const weightForeground = total - weightBackground;
-    if (weightForeground === 0) {
-      break;
-    }
-    sumBackground += t * histogram[t];
-    const meanBackground = sumBackground / weightBackground;
-    const meanForeground = (sum - sumBackground) / weightForeground;
-    const between =
-      weightBackground * weightForeground * (meanBackground - meanForeground) ** 2;
-    if (between > bestVariance) {
-      bestVariance = between;
-      best = t;
-    }
-  }
-  return best;
-}
-
-/** Column-wise ink counts. Ink is darker than the threshold. */
-export function inkProjection(image: GrayImage, threshold: number): Int32Array {
-  const projection = new Int32Array(image.width);
-  for (let y = 0; y < image.height; y++) {
-    const row = y * image.width;
-    for (let x = 0; x < image.width; x++) {
-      if (image.data[row + x] <= threshold) {
-        projection[x]++;
-      }
-    }
-  }
-  return projection;
-}
-
-function median(values: number[]): number {
-  if (values.length === 0) {
-    return 0;
-  }
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = sorted.length >> 1;
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+export interface SegmentConfig {
+  /** Fraction of the region's height, measured from the bottom, to search. */
+  searchFrac: number;
+  /** A band must span at least this fraction of the region width. */
+  minBandWidthFrac: number;
+  /** ... and be no taller than this fraction of the region height. */
+  maxBandHeightFrac: number;
+  /** Padding added above and below the detected line, as a fraction of it. */
+  bandPadFrac: number;
+  /** Centre hops below this fraction of a run's width are inside one glyph. */
+  pitchMinFrac: number;
+  /** Lone marks further than this many pitches from a neighbour are not glyphs. */
+  maxNeighbourPitch: number;
+  /** Runs narrower than this fraction of a glyph are specks. */
+  minGlyphWidthFrac: number;
+  /** Side padding on each glyph crop, as a fraction of its width. */
+  cropPadFrac: number;
+  /** A column counts as inked at this fraction of the band height. */
+  columnNoiseFrac: number;
+  minGlyphs: number;
+  maxGlyphs: number;
+  maxCandidates: number;
+  deskew: boolean;
 }
 
 /**
- * Narrow a crop down to the rows the character line actually occupies.
- *
- * The guide box is deliberately taller than a MICR band, so a crop of it also
- * contains whatever sits above and below -- a signature stroke, the memo rule,
- * the edge of the cheque. Thresholding across all of that makes a full-width
- * dark row read as one ink run spanning the whole crop, and everything after
- * that behaves as if there were no characters at all.
- *
- * Rows are scored by ink, then the densest contiguous stretch is kept. This is
- * the same job locate_band does in the offline Python segmenter, at a smaller
- * scale: it is looking for the line inside the frame, this for the line inside
- * the guide.
+ * Defaults are the SegmentConfig values from the training repo, with two
+ * additions noted in the type above.
  */
-export function locateBandRows(
-  image: GrayImage,
-  threshold: number,
-): { top: number; bottom: number } {
-  const rowInk = new Int32Array(image.height);
-  let peak = 0;
-  for (let y = 0; y < image.height; y++) {
-    const row = y * image.width;
-    let count = 0;
-    for (let x = 0; x < image.width; x++) {
-      if (image.data[row + x] <= threshold) {
-        count++;
-      }
-    }
-    rowInk[y] = count;
-    if (count > peak) {
-      peak = count;
-    }
-  }
-  if (peak === 0) {
-    return { top: 0, bottom: image.height };
-  }
+export const DEFAULT_CONFIG: SegmentConfig = {
+  searchFrac: 1.0,
+  minBandWidthFrac: 0.3,
+  maxBandHeightFrac: 0.16,
+  bandPadFrac: 0.22,
+  pitchMinFrac: 0.6,
+  maxNeighbourPitch: 3.0,
+  minGlyphWidthFrac: 0.12,
+  cropPadFrac: 0.18,
+  columnNoiseFrac: 0.05,
+  minGlyphs: 8,
+  maxGlyphs: 50,
+  maxCandidates: 8,
+  deskew: true,
+};
 
-  // A row belongs to the line if it carries a reasonable share of the peak.
-  // Low enough to keep the thin waist of a glyph, high enough to exclude a
-  // faint background rule.
-  const cutoff = peak * 0.18;
-  let bestTop = 0;
-  let bestLen = 0;
-  let runStart = -1;
-  for (let y = 0; y <= image.height; y++) {
-    const inked = y < image.height && rowInk[y] >= cutoff;
-    if (inked && runStart < 0) {
-      runStart = y;
-    } else if (!inked && runStart >= 0) {
-      if (y - runStart > bestLen) {
-        bestLen = y - runStart;
-        bestTop = runStart;
-      }
-      runStart = -1;
-    }
-  }
-  if (bestLen === 0) {
-    return { top: 0, bottom: image.height };
-  }
-
-  const pad = Math.max(2, Math.round(bestLen * 0.18));
-  return {
-    top: Math.max(0, bestTop - pad),
-    bottom: Math.min(image.height, bestTop + bestLen + pad),
-  };
-}
-
-export function cropRows(image: GrayImage, top: number, bottom: number): GrayImage {
-  const height = Math.max(1, bottom - top);
-  return {
-    data: image.data.subarray(top * image.width, (top + height) * image.width),
-    width: image.width,
-    height,
-  };
-}
-
-export interface Rect {
-  x0: number;
-  y0: number;
-  x1: number;
-  y1: number;
-}
+// --- finding the sheet -----------------------------------------------------
 
 /**
- * Find the sheet of paper in the frame and return its bounds.
+ * Fractional bounds of the sheet of paper within the frame.
  *
- * This has to happen before anything looks for text. A photo of a cheque is
- * mostly desk, and Otsu over the whole frame splits *background from paper*,
- * not *ink from paper* -- so every dark pixel of the desk counts as ink, the
- * rows above and below the cheque come out solid, and they merge into one run
- * far too tall to be a line of text. Every candidate is then discarded and the
- * search reports nothing, on a frame where the band is perfectly visible.
+ * This has to happen before anything looks for a band, and skipping it is not a
+ * small loss of quality -- it is total failure. A photo of a cheque is mostly
+ * desk, and Otsu over the whole frame separates *desk from paper*, not *ink
+ * from paper*. Every pixel of the desk then counts as ink, the rows above and
+ * below the cheque come out solid, and they merge into one run far too tall to
+ * be a line of text. Every candidate is discarded and the search reports
+ * nothing, on a frame where the band is perfectly legible.
  *
- * Cropping to the paper first makes the second threshold mean what the rest of
- * the pipeline assumes it means. This is find_document from the Python
- * segmenter, by brightness profile rather than contours -- a cheque is a
- * bright rectangle on a darker surface, which is all the signal needed.
+ * Measured on the real cheque photos in the training repo at preview
+ * resolution: with this step, chk001 segments to all 32 glyphs; without it, to
+ * zero. The synthetic test cheque hides the problem because the image *is* the
+ * sheet, with no desk around it.
+ *
+ * Brightness profile rather than contour finding: a cheque is a bright
+ * rectangle on a darker surface, which is the whole of the signal needed, and
+ * it costs two passes instead of an edge detector.
  */
-export function findDocumentRect(image: GrayImage): Rect {
+export function findSheet(image: GrayImage): Rect {
+  const { data, width, height } = image;
   const threshold = otsuThreshold(image);
-  const { width, height, data } = image;
 
   const colBright = new Int32Array(width);
   const rowBright = new Int32Array(height);
   for (let y = 0; y < height; y++) {
     const row = y * width;
+    let count = 0;
     for (let x = 0; x < width; x++) {
       if (data[row + x] > threshold) {
         colBright[x]++;
-        rowBright[y]++;
+        count++;
       }
     }
+    rowBright[y] = count;
   }
 
-  // A row or column belongs to the sheet if a good part of it is paper-bright.
-  const span = (counts: Int32Array, extent: number) => {
+  const span = (counts: Int32Array, extent: number): { lo: number; hi: number } => {
     let peak = 0;
     for (let i = 0; i < counts.length; i++) {
-      peak = Math.max(peak, counts[i]);
+      if (counts[i] > peak) {
+        peak = counts[i];
+      }
     }
     if (peak === 0) {
-      return { lo: 0, hi: counts.length };
+      return { lo: 0, hi: extent };
     }
     const cutoff = peak * 0.35;
     let lo = 0;
@@ -220,191 +142,157 @@ export function findDocumentRect(image: GrayImage): Rect {
     while (hi > lo && counts[hi] < cutoff) {
       hi--;
     }
-    // A sliver is not a sheet; fall back to the whole frame rather than
-    // cropping to noise.
-    return hi - lo < extent * 0.2 ? { lo: 0, hi: counts.length } : { lo, hi: hi + 1 };
+    // A sliver is not a sheet. Falling back to the whole frame beats cropping
+    // to a highlight on the desk.
+    return hi - lo < extent * 0.25 ? { lo: 0, hi: extent } : { lo, hi: hi + 1 };
   };
 
   const cols = span(colBright, width);
   const rows = span(rowBright, height);
-  return { x0: cols.lo, y0: rows.lo, x1: cols.hi, y1: rows.hi };
+
+  // A little margin, because the MICR band sits close to the bottom edge and
+  // clipping it is worse than keeping a sliver of desk.
+  const padX = width * 0.01;
+  const padY = height * 0.01;
+  return {
+    x0: clamp(cols.lo - padX, 0, width) / width,
+    y0: clamp(rows.lo - padY, 0, height) / height,
+    x1: clamp(cols.hi + padX, 0, width) / width,
+    y1: clamp(rows.hi + padY, 0, height) / height,
+  };
 }
 
-export function cropRect(image: GrayImage, rect: Rect): GrayImage {
-  const width = Math.max(1, rect.x1 - rect.x0);
-  const height = Math.max(1, rect.y1 - rect.y0);
-  const out = new Uint8Array(width * height);
-  for (let y = 0; y < height; y++) {
-    const src = (rect.y0 + y) * image.width + rect.x0;
-    out.set(image.data.subarray(src, src + width), y * width);
-  }
-  return { data: out, width, height };
+/** Apply a fractional rect to an image of any size. */
+export function cropFraction(image: GrayImage, rect: Rect): GrayImage {
+  return cropImage(image, {
+    x0: rect.x0 * image.width,
+    y0: rect.y0 * image.height,
+    x1: rect.x1 * image.width,
+    y1: rect.y1 * image.height,
+  });
+}
+
+// --- band location ---------------------------------------------------------
+
+export interface BandCandidate {
+  top: number;
+  bottom: number;
+  /** Fraction of the region width the line of ink spans. */
+  coverage: number;
 }
 
 /**
- * Every horizontal strip in the image that might be a line of text.
+ * Horizontal strips that might be a line of print.
  *
- * Rows carrying ink are grouped into runs, with small vertical gaps bridged so
- * the dot of a glyph does not split a line in two. Anything too thin to be
- * print or tall enough to be a block of handwriting is dropped. The caller
- * scores what survives.
- *
- * This is band_candidates from the offline Python segmenter. Ink alone is a
- * weak signal -- a signature or a printed caption carries more of it than the
- * MICR line -- so candidates are ranked later by how well they actually parse
- * as E-13B, not by how dark they are.
+ * Ink is smeared along x first, so a line of separate glyphs becomes one
+ * continuous blob while the cheque's printed border stays a thin rule. The
+ * strips that survive are ranked later by how well they parse as E-13B, never
+ * by how much ink they carry: on a real cheque the signature line, the memo
+ * rule and a printed caption all carry more ink than the MICR line, and picking
+ * the heaviest strip reliably grabs one of those instead.
  */
 export function findBandCandidates(
-  image: GrayImage,
-  threshold: number,
-  options: { maxCandidates?: number } = {},
-): { top: number; bottom: number }[] {
-  const maxCandidates = options.maxCandidates ?? 10;
+  region: GrayImage,
+  mask: InkMask,
+  config: SegmentConfig = DEFAULT_CONFIG,
+): BandCandidate[] {
+  const { width, height } = region;
+  const searchTop = Math.floor(height * (1 - clamp(config.searchFrac, 0.05, 1)));
 
-  const rowInk = new Int32Array(image.height);
-  for (let y = 0; y < image.height; y++) {
-    const row = y * image.width;
-    let count = 0;
-    for (let x = 0; x < image.width; x++) {
-      if (image.data[row + x] <= threshold) {
-        count++;
-      }
-    }
-    rowInk[y] = count;
-  }
+  // Kernel width from the training repo: max(15, width / 40).
+  const smeared = closeHorizontal(mask, Math.max(15, Math.round(width / 40)));
+  const ink = rowInk(smeared);
 
-  // A row counts as "inked" if a small fraction of it is dark. Too high and a
-  // sparse line of digits is missed; too low and paper texture joins up.
-  const minInk = Math.max(3, Math.round(image.width * 0.01));
-  const bridge = Math.max(1, Math.round(image.height * 0.006));
+  const minRowInk = Math.max(2, Math.round(width * config.minBandWidthFrac * 0.4));
+  const minHeight = 4;
+  const maxHeight = Math.max(minHeight + 1, Math.round(height * config.maxBandHeightFrac));
 
-  const runs: { top: number; bottom: number; ink: number }[] = [];
+  // Pass one: the dense core of every line of print.
+  const cores: { top: number; bottom: number; peak: number }[] = [];
   let start = -1;
-  let gap = 0;
-  let ink = 0;
-  for (let y = 0; y <= image.height; y++) {
-    const inked = y < image.height && rowInk[y] >= minInk;
-    if (inked) {
-      if (start < 0) {
-        start = y;
-        ink = 0;
+  for (let y = searchTop; y <= height; y++) {
+    const inked = y < height && ink[y] >= minRowInk;
+    if (inked && start < 0) {
+      start = y;
+    } else if (!inked && start >= 0) {
+      let peak = 0;
+      for (let r = start; r < y; r++) {
+        peak = Math.max(peak, ink[r]);
       }
-      gap = 0;
-      ink += rowInk[y];
-    } else if (start >= 0) {
-      gap++;
-      if (gap > bridge || y === image.height) {
-        runs.push({ top: start, bottom: y - gap + 1, ink });
-        start = -1;
-      }
+      cores.push({ top: start, bottom: y, peak });
+      start = -1;
     }
   }
 
-  const minHeight = Math.max(4, Math.round(image.height * 0.012));
-  const maxHeight = Math.round(image.height * 0.22);
-  return runs
-    .filter(r => {
-      const h = r.bottom - r.top;
-      return h >= minHeight && h <= maxHeight;
-    })
-    .sort((a, b) => b.ink - a.ink)
-    .slice(0, maxCandidates)
-    .map(r => {
-      const pad = Math.max(2, Math.round((r.bottom - r.top) * 0.2));
-      return {
-        top: Math.max(0, r.top - pad),
-        bottom: Math.min(image.height, r.bottom + pad),
-      };
-    });
-}
-
-/** Horizontally mirror an image. Used to undo a flipped sensor. */
-export function mirrorImage(image: GrayImage): GrayImage {
-  const out = new Uint8Array(image.data.length);
-  for (let y = 0; y < image.height; y++) {
-    const row = y * image.width;
-    for (let x = 0; x < image.width; x++) {
-      out[row + x] = image.data[row + image.width - 1 - x];
+  // Pass two: gate each core and pad it out to a band.
+  //
+  // Growing the run outwards over faint rows first was tried, on the theory
+  // that the row threshold clips the sparse top and bottom of a line and hands
+  // the model crops cut through the glyph. The data refuted it: without any
+  // growth the reference cheque reads exactly right at 0.95 confidence, and
+  // with it the band doubles in height, swallows the rule above, and the read
+  // falls apart. `bandPadFrac` is already doing this job.
+  const candidates: BandCandidate[] = [];
+  for (const core of cores) {
+    // Same two gates as the connected-component filter in the Python: the blob
+    // must be wide enough to be a line of print, and short enough not to be a
+    // block of handwriting or a dark region of the photo.
+    const lineHeight = core.bottom - core.top;
+    if (
+      lineHeight >= minHeight &&
+      lineHeight <= maxHeight &&
+      core.peak >= width * config.minBandWidthFrac
+    ) {
+      const pad = Math.round(lineHeight * config.bandPadFrac);
+      candidates.push({
+        top: Math.max(0, core.top - pad),
+        bottom: Math.min(height, core.bottom + pad),
+        coverage: core.peak / width,
+      });
     }
   }
-  return { data: out, width: image.width, height: image.height };
+
+  // Bottom-most first. The MICR line is always the lowest line of print on a
+  // cheque, so this is the order most likely to hit it on the first classify --
+  // but it only orders the work, it never excludes anything.
+  return candidates
+    .sort((a, b) => b.top - a.top)
+    .slice(0, config.maxCandidates);
 }
 
-export interface BandFind {
-  band: GrayImage;
-  boxes: GlyphBox[];
-  quality: number;
-  rows: { top: number; bottom: number };
-  mirrored: boolean;
-}
+// --- glyph boundaries ------------------------------------------------------
 
 /**
- * Search a whole cheque image for the MICR line.
+ * Glyph boundaries, from fitting a fixed-pitch character grid.
  *
- * Every candidate strip is segmented and scored, and the best-parsing one
- * wins. That is what makes this robust to where the cheque sits in frame: no
- * alignment, no guide box, no mapping between preview and sensor coordinates.
+ * Gap-based merging cannot work on E-13B. The transit and on-us symbols are
+ * drawn as several separate vertical strokes, so any gap threshold loose enough
+ * to join one symbol's strokes also joins two adjacent digits, and any
+ * threshold tight enough to keep digits apart shatters the symbols. Both
+ * failure modes showed up on the first real cheque the training code was run
+ * against.
  *
- * Mirroring is deliberately NOT considered here. A mirrored band segments
- * exactly as well as an upright one -- same glyph count, same pitch, same
- * widths -- so no amount of geometry tells the two apart. Only classifying the
- * glyphs and checking the ABA digit does, which is why the mirror retry lives
- * in recognizeDocument instead.
- */
-export function findMicrBand(image: GrayImage): BandFind | null {
-  // Crop to the sheet first, so the threshold that follows separates ink from
-  // paper rather than paper from desk.
-  const paper = cropRect(image, findDocumentRect(image));
-
-  let best: BandFind | null = null;
-  const coarse = otsuThreshold(paper);
-
-  for (const rows of findBandCandidates(paper, coarse)) {
-    const band = cropRows(paper, rows.top, rows.bottom);
-    const boxes = findGlyphBoxes(band, otsuThreshold(band));
-    const quality = bandQuality(boxes);
-    if (quality > 0 && (!best || quality > best.quality)) {
-      best = { band, boxes, quality, rows, mirrored: false };
-    }
-  }
-  return best;
-}
-
-export interface SegmentOptions {
-  /** Centre hops below this fraction of a run's width are inside one glyph. */
-  pitchMinFrac?: number;
-  /** Lone marks further than this many pitches from a neighbour are not glyphs. */
-  maxNeighbourPitch?: number;
-  /** Runs narrower than this fraction of a glyph are specks. */
-  minGlyphWidthFrac?: number;
-}
-
-/**
- * Find glyph boundaries by fitting a fixed-pitch character grid.
- *
- * Gap-based merging cannot work here: the transit and on-us symbols are drawn
- * as several separate vertical strokes, so any threshold loose enough to join
- * one symbol's strokes also joins two adjacent digits. E-13B's constant pitch
- * resolves it -- strokes of one symbol land in one cell, adjacent characters
- * do not, and the blank cells between fields simply hold no ink.
+ * The font's constant pitch resolves it: estimate the pitch, fit a grid, and
+ * let cell membership decide. Strokes of one symbol share a cell, adjacent
+ * characters do not, and the blank cells between fields simply hold no ink.
  */
 export function findGlyphBoxes(
-  image: GrayImage,
-  threshold: number,
-  options: SegmentOptions = {},
+  mask: InkMask,
+  config: SegmentConfig = DEFAULT_CONFIG,
 ): GlyphBox[] {
-  const pitchMinFrac = options.pitchMinFrac ?? 0.6;
-  const maxNeighbourPitch = options.maxNeighbourPitch ?? 3.0;
-  const minGlyphWidthFrac = options.minGlyphWidthFrac ?? 0.12;
+  const projection = columnInk(mask);
+  const width = projection.length;
 
-  const projection = inkProjection(image, threshold);
+  // DIVERGES: the Python treats any non-zero column as inked, which is safe on
+  // a clean Otsu binarisation of an already-cropped band. Here the band comes
+  // straight out of a phone photo, so a noise floor tied to band height stops
+  // a single speckled pixel from welding two glyphs into one run.
+  const noiseFloor = Math.max(1, Math.round(mask.height * config.columnNoiseFrac));
 
-  // Contiguous runs of inked columns, dropping anything touching the edge --
-  // that is the guide border or the neighbouring field, not a glyph.
   const runs: GlyphBox[] = [];
   let start: number | null = null;
-  for (let x = 0; x < projection.length; x++) {
-    const inked = projection[x] > 0;
+  for (let x = 0; x < width; x++) {
+    const inked = projection[x] >= noiseFloor;
     if (inked && start === null) {
       start = x;
     } else if (!inked && start !== null) {
@@ -413,130 +301,477 @@ export function findGlyphBoxes(
     }
   }
   if (start !== null) {
-    runs.push({ x0: start, x1: projection.length });
+    runs.push({ x0: start, x1: width });
   }
 
-  // Runs touching the edge are usually the guide border or a neighbouring
-  // field bleeding in -- but only drop them if something is left. When the
-  // whole crop binarises to one edge-to-edge run, discarding it returned zero
-  // glyphs and the caller could not tell "nothing here" from "one big blob".
-  const trimmed = runs.filter(r => r.x0 > 0 && r.x1 < projection.length);
-  const inner = trimmed.length >= 2 ? trimmed : runs;
-  if (inner.length < 2) {
-    return inner;
+  // Runs touching the edge are the cheque's printed border or a neighbouring
+  // field bleeding in -- but only drop them if something is left, so that a
+  // band which binarises to one edge-to-edge blob still reports that blob
+  // rather than reporting nothing.
+  const trimmed = runs.filter(r => r.x0 > 0 && r.x1 < width);
+  let kept = trimmed.length >= 2 ? trimmed : runs;
+  if (kept.length < 2) {
+    return kept;
   }
 
-  const estimate = (list: GlyphBox[]) => {
-    const widths = list.map(r => r.x1 - r.x0);
-    const base = median(widths);
-    const centres = list.map(r => (r.x0 + r.x1) / 2);
-    const deltas: number[] = [];
-    for (let i = 1; i < centres.length; i++) {
-      deltas.push(centres[i] - centres[i - 1]);
-    }
-    const between = deltas.filter(d => d >= base * pitchMinFrac);
-    return { base, centres, pitch: median(between.length ? between : deltas) };
-  };
-
-  let { base, centres, pitch } = estimate(inner);
-  if (!isFinite(pitch) || pitch <= 1) {
-    return inner;
+  let stats = estimatePitch(kept, config);
+  if (!isFinite(stats.pitch) || stats.pitch <= 1) {
+    return kept;
   }
 
-  // Drop isolated marks: the guide edge, dust, a stray pen line. Every real
-  // glyph has a neighbour within a couple of pitches, even across the blank
-  // cells between fields.
-  let kept = inner;
-  if (inner.length >= 3) {
-    const nearest = centres.map((c, i) => {
-      const left = i > 0 ? c - centres[i - 1] : Infinity;
-      const right = i < centres.length - 1 ? centres[i + 1] - c : Infinity;
-      return Math.min(left, right);
-    });
-    const filtered = inner.filter((_, i) => nearest[i] <= pitch * maxNeighbourPitch);
-    if (filtered.length >= 2 && filtered.length < inner.length) {
-      kept = filtered;
-      ({ base, centres, pitch } = estimate(kept));
+  // Drop anything too wide to be one character. E-13B is fixed pitch, so a
+  // single glyph's ink cannot span much more than one cell -- a run that does
+  // is a rule, a border, or a dark patch of the photo. On a real cheque this
+  // catches a 182 px blob against a 16 px pitch, which otherwise merges into a
+  // cell and corrupts both the pitch estimate and the character it lands on.
+  {
+    const limit = stats.pitch * 1.4;
+    const narrow = kept.filter(r => r.x1 - r.x0 <= limit);
+    if (narrow.length >= 2 && narrow.length < kept.length) {
+      kept = narrow;
+      stats = estimatePitch(kept, config);
+      if (!isFinite(stats.pitch) || stats.pitch <= 1) {
+        return kept;
+      }
     }
   }
 
-  // Fit the grid origin, then group runs by cell.
-  let origin = centres[0];
-  for (let pass = 0; pass < 3; pass++) {
-    let residual = 0;
-    for (const c of centres) {
-      residual += c - origin - Math.round((c - origin) / pitch) * pitch;
+  // Keep only the longest chain of closely-spaced runs.
+  //
+  // A cheque's border rules and corner specks sit a long way from the line, and
+  // the obvious filter -- drop anything with no near neighbour -- does not
+  // remove them, because they arrive in clusters that protect each other. On a
+  // real cheque the leading junk was three marks 24 and 33 px apart sitting
+  // 132 px from the band: every one of them has a close neighbour, so every one
+  // survived, and the read came back with seven extra characters.
+  //
+  // Splitting the runs into chains and keeping the longest is the global
+  // version of the same idea, and the MICR line always wins it: it is 20 to 40
+  // characters of constant pitch, and the junk around it never is.
+  if (kept.length >= 3) {
+    const chains = splitIntoChains(kept, stats.pitch * config.maxNeighbourPitch);
+    const longest = chains.reduce((a, b) => (b.length > a.length ? b : a));
+    if (longest.length >= 2 && longest.length < kept.length) {
+      kept = longest;
+      stats = estimatePitch(kept, config);
+      if (!isFinite(stats.pitch) || stats.pitch <= 1) {
+        return kept;
+      }
     }
-    origin += residual / centres.length;
   }
+
+  const { base, centres } = stats;
+  const grid = fitGrid(centres, stats.pitch);
 
   const cells = new Map<number, GlyphBox>();
-  kept.forEach((run, i) => {
-    const cell = Math.round((centres[i] - origin) / pitch);
+  for (let i = 0; i < kept.length; i++) {
+    const cell = Math.round((centres[i] - grid.origin) / grid.pitch);
     const existing = cells.get(cell);
     cells.set(
       cell,
       existing
-        ? { x0: Math.min(existing.x0, run.x0), x1: Math.max(existing.x1, run.x1) }
-        : { ...run },
+        ? { x0: Math.min(existing.x0, kept[i].x0), x1: Math.max(existing.x1, kept[i].x1) }
+        : { ...kept[i] },
     );
-  });
+  }
 
-  const minWidth = Math.max(1, base * minGlyphWidthFrac);
-  return [...cells.entries()]
+  const minWidth = Math.max(1, base * config.minGlyphWidthFrac);
+  const ordered = [...cells.entries()]
     .sort((a, b) => a[0] - b[0])
     .map(([, box]) => box)
     .filter(box => box.x1 - box.x0 >= minWidth);
+
+  return mergeSplitGlyphs(ordered, grid.pitch);
 }
+
+/**
+ * Rejoin a character the grid cut in half.
+ *
+ * The grid assigns each run of ink to a cell, and a cell boundary landing
+ * inside a multi-stroke symbol splits it. The on-us symbol is the one that
+ * suffers: it is two thin bars and a block, so a boundary falling after the
+ * first bar leaves a 3 px orphan beside a 13 px remainder, against a 17 px
+ * median. The remainder still classifies as on-us; the orphan becomes a phantom
+ * character, and the line comes back one glyph too long with a `D` bolted on
+ * the front. It was the single most common failure on real cheques.
+ *
+ * Fixed pitch is what makes the repair safe. One character's ink cannot span
+ * more than one cell, so two neighbours that *together* still fit inside a
+ * pitch were never two characters. Measured on a real cheque at a 24 px pitch:
+ * the two halves of a split symbol sit 2 px apart and span 18 px together,
+ * while genuinely adjacent characters sit 6 px apart and span 36 px -- the two
+ * cases are nowhere near each other.
+ */
+function mergeSplitGlyphs(boxes: GlyphBox[], pitch: number): GlyphBox[] {
+  if (boxes.length < 2 || !isFinite(pitch) || pitch <= 1) {
+    return boxes;
+  }
+
+  const maxSpan = pitch * 0.95;
+  const maxGap = pitch * 0.35;
+  const merged: GlyphBox[] = [boxes[0]];
+  for (let i = 1; i < boxes.length; i++) {
+    const previous = merged[merged.length - 1];
+    const box = boxes[i];
+    const gap = box.x0 - previous.x1;
+    const span = box.x1 - previous.x0;
+    if (gap <= maxGap && span <= maxSpan) {
+      merged[merged.length - 1] = { x0: previous.x0, x1: box.x1 };
+    } else {
+      merged.push(box);
+    }
+  }
+  return merged;
+}
+
+interface PitchStats {
+  base: number;
+  centres: number[];
+  pitch: number;
+}
+
+/**
+ * Break a left-to-right list of runs wherever the gap exceeds `maxGap`.
+ *
+ * Gaps are measured between edges, not centres: two wide runs whose centres sit
+ * far apart may still be touching, and it is the blank space between them that
+ * says whether they belong to the same line of print.
+ */
+function splitIntoChains(runs: GlyphBox[], maxGap: number): GlyphBox[][] {
+  const chains: GlyphBox[][] = [[runs[0]]];
+  for (let i = 1; i < runs.length; i++) {
+    if (runs[i].x0 - runs[i - 1].x1 > maxGap) {
+      chains.push([runs[i]]);
+    } else {
+      chains[chains.length - 1].push(runs[i]);
+    }
+  }
+  return chains;
+}
+
+/**
+ * Typical run width, and the character pitch.
+ *
+ * The pitch is the median spacing between run centres, ignoring the short hops
+ * between the strokes inside one symbol. With only a handful of multi-stroke
+ * symbols in a 30-odd glyph line, the median still lands on a digit.
+ */
+function estimatePitch(runs: GlyphBox[], config: SegmentConfig): PitchStats {
+  const base = median(runs.map(r => r.x1 - r.x0));
+  const centres = runs.map(r => (r.x0 + r.x1) / 2);
+  const deltas: number[] = [];
+  for (let i = 1; i < centres.length; i++) {
+    deltas.push(centres[i] - centres[i - 1]);
+  }
+  const between = deltas.filter(d => d >= base * config.pitchMinFrac);
+  return { base, centres, pitch: median(between.length ? between : deltas) };
+}
+
+/**
+ * Fit the character grid: both where it starts and how wide its cells are.
+ *
+ * The training code refines only the origin and keeps the pitch as first
+ * estimated. That is fine over a handful of characters and wrong over thirty:
+ * a pitch out by 3% drifts nearly a whole cell across a MICR line, and once the
+ * grid slips, characters at one end start sharing a cell or splitting across
+ * two. The symptom is a line with the right number of boxes but the wrong
+ * contents -- on real cheques, a narrow `1` swallowed by its neighbour and a
+ * stray `D` conjured out of the leftover fragment.
+ *
+ * So: assign each run to its nearest cell, then least-squares regress centre
+ * against cell index to get pitch (slope) and origin (intercept), and repeat.
+ * Assignments stop moving after two or three rounds.
+ */
+interface Grid {
+  origin: number;
+  pitch: number;
+}
+
+function fitGrid(centres: number[], pitch: number): Grid {
+  let grid: Grid = { origin: centres[0], pitch };
+  if (centres.length < 3) {
+    return grid;
+  }
+
+  for (let pass = 0; pass < 4; pass++) {
+    const cells = centres.map(c => Math.round((c - grid.origin) / grid.pitch));
+
+    let meanCell = 0;
+    let meanCentre = 0;
+    for (let i = 0; i < centres.length; i++) {
+      meanCell += cells[i];
+      meanCentre += centres[i];
+    }
+    meanCell /= centres.length;
+    meanCentre /= centres.length;
+
+    let covariance = 0;
+    let variance = 0;
+    for (let i = 0; i < centres.length; i++) {
+      const dCell = cells[i] - meanCell;
+      covariance += dCell * (centres[i] - meanCentre);
+      variance += dCell * dCell;
+    }
+    if (variance <= 0) {
+      return grid;
+    }
+
+    const fitted = covariance / variance;
+    // Refuse a fit that has collapsed or run away -- it means the assignment
+    // stepped to a different multiple of the true pitch, and the previous
+    // round is the better answer.
+    if (!isFinite(fitted) || fitted < pitch * 0.5 || fitted > pitch * 2) {
+      return grid;
+    }
+    grid = { origin: meanCentre - fitted * meanCell, pitch: fitted };
+  }
+  return grid;
+}
+
+/**
+ * How much does this look like a real MICR line rather than texture?
+ *
+ * Counting boxes alone is not enough -- it rewards noise. In the training repo
+ * an upside-down cheque once outscored the right way up, because a band of
+ * texture shattered into 70 fragments. A genuine E-13B line has a bounded
+ * number of characters, widths that cluster (the glyphs differ, but only within
+ * about 2x), and centres that sit on a constant pitch. All three are required.
+ */
+export function bandQuality(
+  boxes: GlyphBox[],
+  config: SegmentConfig = DEFAULT_CONFIG,
+): number {
+  const count = boxes.length;
+  if (count < config.minGlyphs || count > config.maxGlyphs) {
+    return 0;
+  }
+
+  const widths = boxes.map(b => b.x1 - b.x0);
+  const centres = boxes.map(b => (b.x0 + b.x1) / 2);
+  const meanWidth = widths.reduce((a, b) => a + b, 0) / count;
+  if (meanWidth <= 0) {
+    return 0;
+  }
+
+  const deltas: number[] = [];
+  for (let i = 1; i < centres.length; i++) {
+    deltas.push(centres[i] - centres[i - 1]);
+  }
+  const pitch = median(deltas);
+  if (!isFinite(pitch) || pitch <= 0) {
+    return 0;
+  }
+
+  const grid = fitGrid(centres, pitch);
+  let squared = 0;
+  for (const c of centres) {
+    const offset = c - grid.origin;
+    const residual = offset - Math.round(offset / grid.pitch) * grid.pitch;
+    squared += residual * residual;
+  }
+  const gridFit = Math.max(0, 1 - (2 * Math.sqrt(squared / count)) / grid.pitch);
+
+  const variance =
+    widths.reduce((acc, w) => acc + (w - meanWidth) ** 2, 0) / count;
+  const widthFit = Math.max(0, 1 - Math.sqrt(variance) / meanWidth);
+
+  return count * gridFit * widthFit;
+}
+
+/**
+ * Spacing between consecutive glyphs, measured in character cells.
+ *
+ * E-13B is fixed pitch, so neighbouring characters are one cell apart and a
+ * blank cell between fields reads as two. Anything larger is a hole where
+ * characters should have been -- which is the only evidence there is that the
+ * segmenter dropped some, because the model cannot be unsure about a crop it
+ * was never handed.
+ */
+export function cellSteps(boxes: GlyphBox[]): number[] {
+  if (boxes.length < 2) {
+    return [];
+  }
+  const centres = boxes.map(b => (b.x0 + b.x1) / 2);
+  const deltas: number[] = [];
+  for (let i = 1; i < centres.length; i++) {
+    deltas.push(centres[i] - centres[i - 1]);
+  }
+  const pitch = median(deltas);
+  if (!isFinite(pitch) || pitch <= 1) {
+    return deltas.map(() => 1);
+  }
+  return deltas.map(d => Math.max(1, Math.round(d / pitch)));
+}
+
+// --- glyph crops -----------------------------------------------------------
 
 /**
  * Cut one glyph to the model's input size.
  *
- * Full band height, not the glyph's own bounding box: the training renderer
- * places every glyph on one shared baseline at its true relative height, so a
- * dash is short within its crop. Cropping tight here would rescale the dash to
- * full height and hand the model something it never saw in training.
+ * Full band height, never the glyph's own bounding box. The training renderer
+ * places every glyph on one shared baseline at its true relative height, so the
+ * dash is short *within its crop*. Cropping tight here would rescale the dash to
+ * full height and hand the model something that looks nothing like what it was
+ * trained on -- and the dash would come back as a digit.
  *
- * Returns float32 in [0, 1] -- normalisation is inside the model.
+ * Returns float32 in [0, 1]. Normalisation is a layer inside the model, so
+ * nothing else is applied.
  */
 export function cropGlyph(
-  image: GrayImage,
+  band: GrayImage,
   box: GlyphBox,
-  padFrac = 0.18,
+  config: SegmentConfig = DEFAULT_CONFIG,
 ): Float32Array {
-  const pad = Math.round((box.x1 - box.x0) * padFrac);
-  const left = Math.max(0, box.x0 - pad);
-  const right = Math.min(image.width, box.x1 + pad);
-  const cropWidth = Math.max(1, right - left);
+  const pad = Math.round((box.x1 - box.x0) * config.cropPadFrac);
+  const rect: Rect = {
+    x0: box.x0 - pad,
+    y0: 0,
+    x1: box.x1 + pad,
+    y1: band.height,
+  };
+  // Area-weighted, matching the cv2.INTER_AREA the training crops went through.
+  // Nearest-neighbour here cost real accuracy: it aliases the thin strokes of
+  // E-13B into a different thickness at every crop position, which is exactly
+  // the cue separating 8 from 0.
+  const scaled = resample(cropImage(band, rect), INPUT_WIDTH, INPUT_HEIGHT);
 
   const out = new Float32Array(INPUT_WIDTH * INPUT_HEIGHT);
-  for (let y = 0; y < INPUT_HEIGHT; y++) {
-    // Nearest-neighbour is enough: the source band is already close to the
-    // target height, so this is a mild resample, not a big downscale.
-    const srcY = Math.min(
-      image.height - 1,
-      Math.floor((y * image.height) / INPUT_HEIGHT),
-    );
-    for (let x = 0; x < INPUT_WIDTH; x++) {
-      const srcX = left + Math.min(cropWidth - 1, Math.floor((x * cropWidth) / INPUT_WIDTH));
-      out[y * INPUT_WIDTH + x] = image.data[srcY * image.width + srcX] / 255;
-    }
+  for (let i = 0; i < out.length; i++) {
+    out[i] = scaled.data[i] / 255;
   }
   return out;
 }
 
-/** Is this band worth running the model over at all? */
-export function bandQuality(boxes: GlyphBox[]): number {
-  if (boxes.length < 8 || boxes.length > 50) {
-    return 0;
+// --- driver ----------------------------------------------------------------
+
+export interface BandReading {
+  band: GrayImage;
+  boxes: GlyphBox[];
+  /** Raw E-13B plausibility of the segmentation. */
+  quality: number;
+  /** Ordering score: quality, weighted by where the band sits and how long it is. */
+  rank: number;
+  rows: { top: number; bottom: number };
+  threshold: ThresholdMode;
+  /** Deskew slope applied, dy/dx. */
+  slope: number;
+}
+
+/** A MICR line is 2 transit symbols + 9 routing digits + an account, and up. */
+const PLAUSIBLE_MIN_GLYPHS = 19;
+const PLAUSIBLE_MAX_GLYPHS = 40;
+
+/**
+ * Order candidate bands so the likeliest MICR line is classified first.
+ *
+ * Raw segmentation quality is not enough on its own. A block of clean sans
+ * headline text segments into well-pitched, similar-width boxes and can outrank
+ * the real band -- running the training repo's segmenter over the synthetic test
+ * cheque, it settled on an upside-down "ACME MANUFACTURING LLC". Two cheap
+ * priors fix the ordering:
+ *
+ *   * the MICR line is the bottom-most line of print on a cheque, and
+ *   * it is between about 19 and 40 characters long.
+ *
+ * Neither is a filter. Both only decide what is tried first, because the thing
+ * that actually settles it is the ABA checksum a few steps later.
+ */
+function rankBand(quality: number, boxes: number, centreFrac: number): number {
+  const bottomness = 0.55 + 0.45 * clamp(centreFrac, 0, 1);
+  const plausible =
+    boxes >= PLAUSIBLE_MIN_GLYPHS && boxes <= PLAUSIBLE_MAX_GLYPHS ? 1 : 0.55;
+  return quality * bottomness * plausible;
+}
+
+/**
+ * Every plausible MICR band in a region, best-scoring first.
+ *
+ * Both threshold strategies are tried on every candidate. Otsu is right for an
+ * evenly-lit cheque and adaptive is right for one lit from the side, and which
+ * applies cannot be known in advance -- so both are scored and the better one
+ * wins. This is affordable precisely because scoring involves no model: it is
+ * projections and a median, and only the handful of survivors ever reach the
+ * network.
+ */
+export function readBands(
+  region: GrayImage,
+  config: SegmentConfig = DEFAULT_CONFIG,
+  modes: ThresholdMode[] = ['otsu', 'adaptive'],
+  full?: GrayImage,
+): BandReading[] {
+  const readings: BandReading[] = [];
+
+  // Locating the band is a coarse job -- row sums over a smeared mask -- and
+  // does not need full resolution. Cutting the strip does. So `region` can be a
+  // downscaled scout while `full` carries the pixels the crops come from, which
+  // is what keeps a 2400 px photo from being thresholded end to end several
+  // times over. Passing neither is the same image for both.
+  const source = full ?? region;
+  const scale = source.height / Math.max(1, region.height);
+
+  // Locating a line of print is a coarse job and Otsu does it; the adaptive
+  // pass exists for uneven lighting *within* the band. Running both over the
+  // whole photo was pure cost -- so adaptive is only reached for the search if
+  // Otsu turns up nothing at all, which is the genuinely badly-lit case.
+  let candidates = findBandCandidates(region, inkMask(region, 'otsu'), config);
+  if (candidates.length === 0 && modes.includes('adaptive')) {
+    candidates = findBandCandidates(region, inkMask(region, 'adaptive'), config);
   }
-  const widths = boxes.map(b => b.x1 - b.x0);
-  const mean = widths.reduce((a, b) => a + b, 0) / widths.length;
-  if (mean <= 0) {
-    return 0;
+
+  for (const candidate of candidates) {
+    const top = Math.round(candidate.top * scale);
+    const bottom = Math.round(candidate.bottom * scale);
+    const raw = cropRows(source, top, bottom);
+    if (raw.height < 8 || raw.width < 32) {
+      continue;
+    }
+    const centreFrac =
+      (candidate.top + candidate.bottom) / 2 / Math.max(1, region.height);
+
+    // Both thresholds are tried here, on the strip alone. A band is a few
+    // hundred thousand pixels against the photo's several million, so trying
+    // two ways of binarising it costs almost nothing -- and which one is right
+    // genuinely cannot be known in advance.
+    for (const mode of modes) {
+      let band = raw;
+      let mask = inkMask(raw, mode);
+      let slope = 0;
+      if (config.deskew) {
+        slope = estimateShear(mask);
+        // Only re-threshold if the shear actually moved anything. On a guided
+        // capture the band is usually already level, and thresholding a strip
+        // twice for a slope of zero was doubling the cost of the search.
+        if (Math.abs(slope) > 1e-3) {
+          band = shearVertical(raw, slope);
+          mask = inkMask(band, mode);
+        }
+      }
+
+      const boxes = findGlyphBoxes(mask, config);
+      const quality = bandQuality(boxes, config);
+      if (quality > 0) {
+        readings.push({
+          band,
+          boxes,
+          quality,
+          rank: rankBand(quality, boxes.length, centreFrac),
+          // In `full` coordinates, so the caller can draw the band back over
+          // the photo it handed in.
+          rows: { top, bottom },
+          threshold: mode,
+          slope,
+        });
+      }
+    }
   }
-  const variance =
-    widths.reduce((acc, w) => acc + (w - mean) ** 2, 0) / widths.length;
-  const cv = Math.sqrt(variance) / mean;
-  return boxes.length * Math.max(0, 1 - cv);
+
+  return readings.sort((a, b) => b.rank - a.rank);
+}
+
+/** The single best-scoring band in a region, or null if none parses as E-13B. */
+export function findMicrBand(
+  region: GrayImage,
+  config: SegmentConfig = DEFAULT_CONFIG,
+): BandReading | null {
+  return readBands(region, config)[0] ?? null;
 }

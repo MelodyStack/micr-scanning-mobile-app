@@ -22,7 +22,8 @@ export interface ParseResult {
 }
 
 /**
- * ABA checksum: weights 3, 7, 1 across the nine digits, sum mod 10 must be 0.
+ * ABA checksum: weights 3, 7, 1 repeating across the nine digits; the weighted
+ * sum must be a multiple of 10.
  */
 export function abaChecksumValid(routing: string): boolean {
   if (!/^\d{9}$/.test(routing)) {
@@ -36,29 +37,37 @@ export function abaChecksumValid(routing: string): boolean {
   return sum % 10 === 0;
 }
 
+/** Longest on-us field the ANSI layout allows, plus room for a misread. */
+const MAX_ACCOUNT_DIGITS = 17;
+
 /**
  * Parse a substituted MICR line (T/A/O/D plus digits).
  *
  * Handles both layouts, which is the trap spec section 8 calls out: many
- * personal checks leave the leading auxiliary field empty and append the check
- * number to the on-us field after the account number. Splitting on position
- * rather than on "the digits before the first O" is what stops account numbers
- * coming out with the check number glued on.
+ * personal cheques leave the leading auxiliary field empty and append the
+ * cheque number to the on-us field *after* the account number. Splitting by
+ * position rather than by "the digits before the first O" is what stops account
+ * numbers coming out with the cheque number glued on.
  *
- *   O013708O T113000023T 586033512335O   -> aux holds the check number
- *   T111000614T 687808910O8241           -> check number trails the on-us
+ *   O013708O T113000023T 586033512335O   aux field holds the cheque number
+ *   T111000614T 687808910O8241           cheque number trails the on-us field
  */
 export function parseMicr(raw: string): ParseResult {
   const line = raw.replace(/\s+/g, '');
 
+  if (line.length === 0) {
+    return { ok: false, raw, error: 'nothing was read' };
+  }
   if (!/^[0-9TAOD]*$/.test(line)) {
     return { ok: false, raw, error: 'line contains non-MICR characters' };
   }
 
-  const transitPositions = [...line].reduce<number[]>(
-    (acc, ch, i) => (ch === 'T' ? [...acc, i] : acc),
-    [],
-  );
+  const transitPositions: number[] = [];
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] === 'T') {
+      transitPositions.push(i);
+    }
+  }
   if (transitPositions.length !== 2) {
     return {
       ok: false,
@@ -77,7 +86,7 @@ export function parseMicr(raw: string): ParseResult {
     };
   }
 
-  // Leading auxiliary field, if present: O<digits>O before the transit field.
+  // Leading auxiliary field, if present: O<digits>O ahead of the transit field.
   const head = line.slice(0, tStart);
   let checkNumber: string | null = null;
   const auxMatch = head.match(/^O(\d+)O$/);
@@ -93,19 +102,32 @@ export function parseMicr(raw: string): ParseResult {
   const amountField = amountMatch ? amountMatch[1] : null;
   const onus = amountMatch ? tail.replace(amountMatch[0], '') : tail;
 
-  const parts = onus.split('O').filter(p => p.length > 0);
+  const parts = onus.split('O').filter(part => part.length > 0);
   if (parts.length === 0) {
-    return { ok: false, raw, error: 'no account number found after the routing field' };
+    return { ok: false, raw, error: 'no account number after the routing field' };
   }
 
-  const account = parts[0];
+  // The dash is a separator inside the on-us field on plenty of cheques, not a
+  // digit. It is kept in `raw` for traceability and dropped from the value the
+  // backend receives, which is the convention the existing web app follows.
+  const account = parts[0].replace(/D/g, '');
   if (checkNumber === null && parts.length > 1) {
-    // Personal-check layout: account, on-us symbol, then the check number.
-    checkNumber = parts[parts.length - 1];
+    // Personal-cheque layout: account, on-us symbol, then the cheque number.
+    checkNumber = parts[parts.length - 1].replace(/D/g, '');
   }
 
   if (!/^\d+$/.test(account)) {
-    return { ok: false, raw, error: `account ${account} is not numeric` };
+    return { ok: false, raw, error: `account "${parts[0]}" is not numeric` };
+  }
+  if (account.length > MAX_ACCOUNT_DIGITS) {
+    return {
+      ok: false,
+      raw,
+      error: `account number is ${account.length} digits, longer than the layout allows`,
+    };
+  }
+  if (checkNumber !== null && !/^\d+$/.test(checkNumber)) {
+    return { ok: false, raw, error: `cheque number "${checkNumber}" is not numeric` };
   }
 
   return {
