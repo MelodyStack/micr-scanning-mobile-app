@@ -110,9 +110,24 @@ android {
     // a universal APK carrying all four comes to roughly 250 MB. x86 builds are
     // emulator-only and are left out; add them back if you need to install a
     // release build on one.
+    //
+    // Per-ABI APKs are smaller but push a choice onto whoever installs them, and
+    // picking the wrong one fails as "App not installed" with no hint as to why
+    // -- indistinguishable, to the person holding the phone, from a broken
+    // build. For anything handed to someone else, build the universal APK:
+    //
+    //   ./gradlew assembleRelease -PMICR_UNIVERSAL=1 \
+    //       -PreactNativeArchitectures=arm64-v8a,armeabi-v7a
+    //
+    // which produces a single app-release.apk that installs on any phone. The
+    // architecture list matters: disabling the splits leaves nothing else to
+    // narrow the build, so it otherwise packages all four ABIs and comes to
+    // ~147 MB, half of it x86 code no phone will ever run. Note that Android's
+    // `ndk.abiFilters` does *not* work here -- React Native drives the ABI set
+    // from its own `reactNativeArchitectures` property.
     splits {
         abi {
-            enable true
+            enable !project.hasProperty('MICR_UNIVERSAL')
             reset()
             // Override for a one-off build, e.g. an emulator check:
             //   ./gradlew assembleRelease -PMICR_ABIS=x86_64
