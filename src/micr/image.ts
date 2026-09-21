@@ -1,15 +1,10 @@
 /**
  * Grayscale image primitives.
  *
- * Deliberately dependency-free: every function here is ordinary TypeScript over
- * a Uint8Array, so the whole pipeline can be unit-tested on a laptop with no
- * device, no camera and no native modules. Only `decode.ts` touches Skia.
- *
- * These mirror the OpenCV calls in micr/segment.py from the training repo. That
- * correspondence is load-bearing: the model was trained on crops that OpenCV
- * produced, so a crop produced differently here is a crop the model has never
- * seen. Where an approximation is used instead of the exact OpenCV algorithm it
- * is called out in the comment above it.
+ * Dependency-free, so the whole pipeline can be unit-tested with no device or
+ * native modules; only `decode.ts` touches Skia. These mirror the OpenCV calls
+ * in micr/segment.py, and that correspondence is load-bearing: the model was
+ * trained on crops OpenCV produced. Approximations are called out where used.
  */
 
 export interface GrayImage {
@@ -115,7 +110,7 @@ export function mirrorImage(image: GrayImage): GrayImage {
   return { data: out, width, height };
 }
 
-// --- resampling ------------------------------------------------------------
+// Resampling
 
 interface Taps {
   /** Absolute, pre-clamped source index per tap. */
@@ -126,13 +121,9 @@ interface Taps {
 }
 
 /**
- * Per-output-pixel source ranges and weights for a 1-D resize.
- *
- * Downscaling averages over the whole source interval, which is what
- * cv2.INTER_AREA does and what the training crops went through. Upscaling falls
- * back to bilinear, since INTER_AREA degenerates to nearest-neighbour there and
- * bilinear is the better behaviour for a crop that happens to be smaller than
- * the model input.
+ * Per-output-pixel source ranges and weights for a 1-D resize. Downscaling
+ * averages over the source interval as cv2.INTER_AREA does; upscaling falls back
+ * to bilinear, since INTER_AREA degenerates to nearest-neighbour there.
  */
 function buildTaps(srcSize: number, outSize: number): Taps {
   const scale = srcSize / outSize;
@@ -194,10 +185,10 @@ export function resample(image: GrayImage, outW: number, outH: number): GrayImag
     return { data: Uint8Array.from(image.data), width, height };
   }
 
-  // Everything the inner loops touch is hoisted into a local. These run over
-  // millions of pixels on Hermes, which interprets bytecode rather than
-  // JIT-compiling it, so a property load left inside the loop is a real cost --
-  // hoisting these took a 1600 px rescale from ~790 ms to a fraction of that.
+  // Everything the inner loops touch is hoisted into a local. Hermes interprets
+  // bytecode rather than JIT-compiling it, so a property load left inside a loop
+  // over millions of pixels is a real cost: hoisting took a 1600 px rescale from
+  // ~790 ms to 31 ms.
   const src = image.data;
   const srcW = image.width;
   const srcH = image.height;
@@ -266,17 +257,12 @@ export function fitWithin(image: GrayImage, maxSide: number): GrayImage {
 }
 
 /**
- * The three resolutions a read works at.
+ * The three resolutions a read works at, each needing far fewer pixels than the
+ * last: `probe` decides which way up the cheque is, `scout` locates the band,
+ * and `work` is the only level glyph crops are cut from.
  *
- * Each stage needs far fewer pixels than the last, and doing them all at full
- * size is most of what a read costs:
- *
- *   probe  ~800   deciding which way up the cheque is
- *   scout  ~1200  locating the band within the sheet
- *   work   ~2400  the only level glyph crops are ever cut from
- *
- * decode.ts builds these with Skia, so the scaling happens in native code. The
- * JS fallback here exists for tests and for a caller that already has pixels.
+ * decode.ts builds these with Skia so the scaling happens in native code. The JS
+ * fallback here exists for tests and for a caller that already has pixels.
  */
 export interface ImagePyramid {
   work: GrayImage;
@@ -285,14 +271,10 @@ export interface ImagePyramid {
 }
 
 /**
- * Chosen against what each stage actually needs, not for headroom.
- *
- * At `work` = 1800 a 6.14 inch cheque is ~293 px/inch, so E-13B's 8 characters
- * per inch land on a 37 px pitch and the padded band is ~85 px tall. Every
- * glyph crop is therefore a downscale to 32x48, the same direction the
- * training crops were resampled in, which is the property that matters. Going
- * higher only buys pixels the model throws away, and every stage of the search
- * scales with them: at 2400 a read took 7.0 s on device.
+ * Chosen against what each stage needs, not for headroom. At `work` = 1800 a
+ * cheque is ~293 px/inch, so E-13B's 8 characters per inch land on a 37 px pitch
+ * and every glyph crop is a downscale to 32x48, the direction the training crops
+ * were resampled in. At 2400 a read took 7.0 s on device.
  */
 export const PYRAMID_SIZES = { work: 1800, scout: 1000, probe: 700 } as const;
 
@@ -309,7 +291,7 @@ export function isPyramid(value: GrayImage | ImagePyramid): value is ImagePyrami
   return (value as ImagePyramid).work !== undefined;
 }
 
-// --- thresholding ----------------------------------------------------------
+// Thresholding
 
 /** Separable 3x3 blur with a [1 2 1] kernel, matching cv2.GaussianBlur(3, 3). */
 export function blur3(image: GrayImage): GrayImage {
@@ -381,11 +363,9 @@ export type ThresholdMode = 'otsu' | 'adaptive';
 /**
  * Ink mask. Ink is dark, so a pixel is ink when it sits below the threshold.
  *
- * `adaptive` approximates cv2.ADAPTIVE_THRESH_GAUSSIAN_C with a box mean over
- * an integral image: O(n) regardless of window size. The difference from
- * a true Gaussian window is immaterial at the block sizes used here. It is what
- * rescues a cheque photographed under a side light, where one global threshold
- * either loses the shaded end of the band or floods the lit end.
+ * `adaptive` approximates cv2.ADAPTIVE_THRESH_GAUSSIAN_C with a box mean over an
+ * integral image, O(n) regardless of window size. It rescues a cheque shot under
+ * a side light, where one global threshold loses one end of the band.
  */
 export function inkMask(
   image: GrayImage,
@@ -459,7 +439,7 @@ export function inkMask(
   return { data: out, width, height };
 }
 
-// --- projections -----------------------------------------------------------
+// Projections
 
 export function columnInk(mask: InkMask): Int32Array {
   const out = new Int32Array(mask.width);
@@ -490,12 +470,9 @@ export function rowInk(mask: InkMask): Int32Array {
 }
 
 /**
- * Close along x: bridge horizontal gaps up to `kernel` pixels.
- *
- * This is the 1-D equivalent of the MORPH_CLOSE with a (kernel, 1) rectangle in
- * band_candidates(). Its job is to smear a line of separate glyphs into one
- * continuous blob so a row of text reads as a band, while leaving the thin
- * printed border of the cheque as a thin line.
+ * Close along x: bridge horizontal gaps up to `kernel` pixels. The 1-D
+ * equivalent of the MORPH_CLOSE in band_candidates(), smearing a line of glyphs
+ * into one blob while leaving the cheque's printed border a thin line.
  */
 export function closeHorizontal(mask: InkMask, kernel: number): InkMask {
   const k = Math.max(1, Math.round(kernel));
@@ -519,17 +496,14 @@ export function closeHorizontal(mask: InkMask, kernel: number): InkMask {
   return { data: out, width, height };
 }
 
-// --- deskew ----------------------------------------------------------------
+// Deskew
 
 /**
  * Slope (dy/dx) that makes the text baseline horizontal.
  *
- * The offline segmenter uses cv2.minAreaRect over the ink. This uses the
- * classic projection-profile method instead: shear the ink by a candidate
- * slope, and score how tightly it piles into a few rows. It is more stable than
- * minAreaRect on a band that has picked up a fragment of the cheque border,
- * which is the case minAreaRect handles worst. The training code guards that
- * with a +/-12 degree sanity clamp for exactly this reason.
+ * DIVERGES: the offline segmenter uses cv2.minAreaRect. This shears the ink by a
+ * candidate slope and scores how tightly it piles into a few rows, which is more
+ * stable on a band that has picked up a fragment of the cheque border.
  */
 export function estimateShear(mask: InkMask, maxSlope?: number, steps = 21): number {
   const { width, height, data } = mask;
@@ -537,12 +511,9 @@ export function estimateShear(mask: InkMask, maxSlope?: number, steps = 21): num
     return 0;
   }
 
-  // A shear moves the outermost column by slope * width/2. Allowing more than
-  // the strip can physically hold just slides the text out of its own crop, so
-  // the limit is set by the aspect ratio. A 46 px band across 1600 px tolerates
-  // barely 1.6 degrees before the line leaves the band at one end, and a
-  // cheque skewed further than that would not have produced a clean, short row
-  // of ink for the band finder to latch onto in the first place.
+  // A shear moves the outermost column by slope * width/2, so allowing more
+  // than the strip can hold slides the text out of its own crop. A 46 px band
+  // across 1600 px tolerates barely 1.6 degrees.
   const geometric = (0.6 * height) / width;
   const limit = Math.min(maxSlope ?? 0.18, geometric);
   if (limit <= 1e-3) {
@@ -617,11 +588,9 @@ export function estimateShear(mask: InkMask, maxSlope?: number, steps = 21): num
 }
 
 /**
- * Apply a vertical shear, which straightens a mildly rotated band.
- *
- * For the angles that survive a guided capture (a few degrees) a shear and a
- * rotation are the same transform to within a fraction of a pixel, and a shear
- * needs only a vertical resample per column.
+ * Apply a vertical shear, which straightens a mildly rotated band. At the few
+ * degrees a guided capture produces, a shear and a rotation are the same
+ * transform to within a fraction of a pixel, and a shear is cheaper.
  */
 export function shearVertical(image: GrayImage, slope: number): GrayImage {
   if (!isFinite(slope) || Math.abs(slope) < 1e-3) {

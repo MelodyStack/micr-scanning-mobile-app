@@ -27,7 +27,7 @@ import {
   softmaxAll,
 } from '../src/micr/recognize';
 
-// --- fixture ---------------------------------------------------------------
+// Fixture
 //
 // A synthetic cheque rendered from the same E-13B font the model was trained
 // on, exported as raw grayscale so it can be loaded here without Skia or a
@@ -269,7 +269,7 @@ describe('image primitives', () => {
   });
 });
 
-// --- synthetic bands -------------------------------------------------------
+// Synthetic bands
 
 /** A band of evenly pitched dark bars on light paper. */
 function stripes(
@@ -429,7 +429,7 @@ describe('glyph segmentation', () => {
   });
 });
 
-// --- the real thing --------------------------------------------------------
+// The real thing
 
 describe('finding the band in a whole cheque', () => {
   it('segments the MICR line into exactly its 32 glyphs', () => {
@@ -505,7 +505,7 @@ describe('finding the band in a whole cheque', () => {
   });
 });
 
-// --- end to end, with a stand-in for the network ---------------------------
+// End to end, with a stand-in for the network
 
 /**
  * A model that returns the right answer for a correctly ordered band.

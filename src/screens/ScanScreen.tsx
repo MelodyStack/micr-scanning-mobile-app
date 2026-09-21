@@ -1,19 +1,10 @@
 /**
  * The one screen: frame a cheque, tap, get validated fields back.
  *
- * Tap-to-capture rather than a live frame processor, for two reasons that both
- * turned out to matter more than the convenience of continuous scanning:
- *
- *  * Resolution. A still is 4032x3024, which is ~90 px per MICR glyph. A video
- *    frame processed at 960 px gives ~30, and the model was trained on crops
- *    cut from full-resolution photos.
- *  * Frame processors on VisionCamera v4 require react-native-worklets-core,
- *    which has no build for this React Native version. It fails to link
- *    `__cxa_init_primary_exception` and takes the process down during
- *    TurboModule init, before any JavaScript runs at all.
- *
- * So there are no worklets anywhere in this app. Capture is a promise, decoding
- * is Skia, and recognition is ordinary TypeScript on the JS thread.
+ * Tap-to-capture rather than a live frame processor. A still gives ~90 px per
+ * MICR glyph against ~30 from a video frame, and VisionCamera v4's frame
+ * processors need react-native-worklets-core, which has no build for this React
+ * Native version. See the README.
  */
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
@@ -45,28 +36,14 @@ import {
 import ResultCard from '../components/ResultCard';
 import ScanOverlay from '../components/ScanOverlay';
 
-/**
- * The float32 build, named for what it is.
- *
- * `export/` in the training repo holds float32, fp16 and int8 builds of the
- * same weights. This app previously bundled the int8 one under the plain
- * `micr_cnn_v1.tflite` name, so nothing on disk said which was shipping and
- * copying the fp32 export over it would have silently swapped models. The int8
- * build measures 99.67% argmax parity against PyTorch versus 100% for float32,
- * and the difference costs 350 KB of APK, which is not a trade worth making
- * when the whole design leans on reads being right.
- */
+// Named for which build it is: export/ holds float32, fp16 and int8 copies of
+// the same weights, and a plain name would let them be swapped unnoticed.
 const MODEL = require('../../assets/micr_cnn_v1_fp32.tflite');
 
 type Phase = 'loading' | 'ready' | 'working' | 'done' | 'error';
 
-/**
- * Step markers, dev builds only.
- *
- * A read is several seconds of native decode plus several of JS. When one of
- * those stalls the screen just sits there, and from the outside a hang in Skia
- * looks identical to a slow segmentation. These are what tell the two apart.
- */
+// Step markers, dev builds only. A hang in the native decode looks identical
+// to a slow segmentation from the outside; these tell the two apart.
 function trace(message: string): void {
   if (__DEV__) {
     console.log(`[scanner] ${message}`);
@@ -76,13 +53,9 @@ function trace(message: string): void {
 export default function ScanScreen() {
   const { hasPermission, requestPermission } = useCameraPermission();
   const device = useCameraDevice('back');
-  // The largest photo the sensor offers. Every extra pixel across the band is
-  // one the segmenter does not have to invent.
   const format = useCameraFormat(device, [{ photoResolution: 'max' }]);
-  // The camera LED. Lighting is the biggest lever on whether a band segments
-  // cleanly, so it earns its place on real hardware. Emulators have no LED, and
-  // asking CameraX for a flash that does not exist throws FlashUnavailableError
-  // straight out of takePhoto.
+  // Asking CameraX for a flash the device does not have throws
+  // FlashUnavailableError straight out of takePhoto.
   const hasTorch = device?.hasTorch ?? false;
 
   const camera = useRef<Camera>(null);
@@ -105,23 +78,16 @@ export default function ScanScreen() {
   useEffect(() => {
     let cancelled = false;
 
-    /**
-     * Load on CPU first, then try to upgrade to a hardware delegate.
-     *
-     * NNAPI is missing or broken on plenty of devices, emulators especially,
-     * and asking for it up front takes the whole app down instead of falling
-     * back. The model is 123k parameters on a 48x32 crop, so the CPU is
-     * perfectly quick; the delegate is a bonus, never a requirement.
-     */
+    // CPU first, then try to upgrade to NNAPI. NNAPI is missing or broken on
+    // plenty of devices and asking for it up front takes the app down instead
+    // of falling back. At 123k parameters the CPU is quick enough anyway.
     loadTensorflowModel(MODEL, [])
       .then(loaded => {
         if (cancelled) {
           return;
         }
-        // Worth checking every launch: export/ holds a float32, an fp16 and an
-        // int8 build, and the app bundles one of them under a name that does
-        // not say which. The wrong file returns confident nonsense that the
-        // checksum rejects with no clue why.
+        // The wrong model file returns confident nonsense that the checksum
+        // rejects with no clue why.
         const mismatch = checkModelContract(loaded);
         if (mismatch) {
           setError(mismatch);
@@ -161,8 +127,6 @@ export default function ScanScreen() {
       setNote('Reading the number line…');
       const started = Date.now();
       try {
-        // Decoding is native and quick; recognition is a second or two of plain
-        // JavaScript. Yielding first lets the spinner actually paint.
         trace('decode: start');
         const pyramid = await load();
         trace(
@@ -170,6 +134,7 @@ export default function ScanScreen() {
             `scout=${pyramid.scout.width}x${pyramid.scout.height} ` +
             `probe=${pyramid.probe.width}x${pyramid.probe.height}`,
         );
+        // Yield so the spinner paints before recognition blocks the JS thread.
         await new Promise(resolve => setTimeout(resolve, 0));
 
         trace('recognize: start');
@@ -205,25 +170,11 @@ export default function ScanScreen() {
   /**
    * Full-resolution capture, falling back to a preview snapshot.
    *
-   * `takePhoto` is the one worth having: it is the full sensor frame, and
-   * pixels across the MICR band are the whole reason this app captures stills
-   * rather than video frames.
-   *
-   * But CameraX finishes every photo by writing EXIF orientation back into the
-   * file, and `ExifInterface` rejects anything it cannot parse as JPEG/PNG/WebP.
-   * Emulators with a virtual camera, LDPlayer among them, produce exactly that:
-   * the capture succeeds, the bytes reach disk, and the whole thing is thrown
-   * away over a metadata write.
-   *
-   *   androidx.camera.core.ImageCaptureException: Failed to update Exif data
-   *   Caused by: java.io.IOException: ExifInterface only supports saving
-   *     attributes on JPEG, PNG, or WebP formats.
-   *
-   * `takeSnapshot` grabs the preview view's bitmap and compresses it itself, so
-   * it never goes near ExifInterface. It is limited to the size of the preview
-   * on screen, which is a real loss of resolution, hence second choice rather
-   * than first. It is still the difference between a usable scanner and a dead
-   * button on a virtual device.
+   * CameraX finishes every photo by writing EXIF orientation back into the file,
+   * and ExifInterface rejects anything it cannot parse as JPEG/PNG/WebP. Virtual
+   * cameras produce exactly that, so the capture succeeds and is then thrown
+   * away over a metadata write. `takeSnapshot` compresses the preview bitmap
+   * itself and never touches ExifInterface, at the cost of resolution.
    */
   const capture = useCallback(async () => {
     const device_ = camera.current;
@@ -326,10 +277,8 @@ export default function ScanScreen() {
         </Centered>
       )}
 
-      {/* Overlay and controls are a column above the camera, so the guide is
-          centred in whatever space is left between the header and the control
-          bar. Floating the controls over the preview put the torch and the
-          shutter on top of both ends of the MICR band. */}
+      {/* A column rather than floating controls, which otherwise sit on top of
+          both ends of the MICR band. */}
       <View style={styles.stack} pointerEvents="box-none">
         <View style={styles.overlaySlot} pointerEvents="none">
           <ScanOverlay

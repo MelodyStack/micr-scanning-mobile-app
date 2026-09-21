@@ -1,13 +1,10 @@
 /**
  * Find the MICR band in a cheque photo and cut it into glyph crops.
  *
- * A port of micr/segment.py from the training repo. Keeping the two in step
- * matters: the model only ever saw crops the Python segmenter produced, so a
- * crop cut to different proportions here is an input it was never trained on.
- * Deliberate differences are marked DIVERGES.
- *
- * Nothing here imports a native module, so the whole file is exercised by
- * __tests__/micr.test.ts on synthetic images with no device involved.
+ * A port of micr/segment.py from the training repo. The model only ever saw
+ * crops the Python segmenter produced, so a crop cut to different proportions
+ * here is an input it was never trained on. Deliberate differences are marked
+ * DIVERGES. Nothing here imports a native module.
  */
 
 import { INPUT_HEIGHT, INPUT_WIDTH } from './classes';
@@ -49,12 +46,8 @@ export interface SegmentConfig {
   /** Centre hops below this fraction of a run's width are inside one glyph. */
   pitchMinFrac: number;
   /**
-   * Gap, in pitches, that ends one chain of print and starts another.
-   *
-   * Measured across the real cheque photos: a correctly segmented cheque has a
-   * largest internal gap of 1.24 to 1.46 pitches (the blank cells between
-   * fields), while edge micro-print picked up by the band sat 2.96 pitches out.
-   * 2.0 sits between the two. The training repo's 3.0 let the junk through.
+   * Gap, in pitches, that ends one chain of print and starts another. Real
+   * cheques run 1.24 to 1.46 between fields; edge micro-print sat 2.96 out.
    */
   maxNeighbourPitch: number;
   /** Runs narrower than this fraction of a glyph are specks. */
@@ -89,20 +82,15 @@ export const DEFAULT_CONFIG: SegmentConfig = {
   deskew: true,
 };
 
-// --- finding the sheet -----------------------------------------------------
+// Finding the sheet
 
 /**
  * Fractional bounds of the sheet of paper within the frame.
  *
  * Must run before anything looks for a band. A photo of a cheque is mostly
  * desk, so Otsu over the whole frame separates desk from paper rather than ink
- * from paper: the desk counts as ink, the rows above and below the cheque come
- * out solid, and they merge into one run far too tall to be a line of text.
- * Every candidate is then discarded on a frame where the band is legible. With
- * this step chk001 segments to all 32 glyphs; without it, to zero.
- *
- * A brightness profile is enough, since a cheque is a bright rectangle on a
- * darker surface. Two passes instead of an edge detector.
+ * from paper, and every candidate is discarded on a frame where the band is
+ * legible. With this step chk001 segments to all 32 glyphs; without it, zero.
  */
 export function findSheet(image: GrayImage): Rect {
   const { data, width, height } = image;
@@ -171,7 +159,7 @@ export function cropFraction(image: GrayImage, rect: Rect): GrayImage {
   });
 }
 
-// --- band location ---------------------------------------------------------
+// Band location
 
 export interface BandCandidate {
   top: number;
@@ -181,12 +169,10 @@ export interface BandCandidate {
 }
 
 /**
- * Horizontal strips that might be a line of print.
- *
- * Ink is smeared along x first, so a line of separate glyphs becomes one blob
- * while the printed border stays a thin rule. Survivors are ranked later by how
- * well they parse as E-13B, never by how much ink they carry: the signature
- * line, memo rule and printed captions all carry more ink than the MICR line.
+ * Horizontal strips that might be a line of print. Ink is smeared along x, so a
+ * line of glyphs becomes one blob while the printed border stays a thin rule.
+ * Ranked later by how well they parse as E-13B, never by how much ink they
+ * carry, since the signature line and memo rule carry more.
  */
 export function findBandCandidates(
   region: GrayImage,
@@ -222,13 +208,11 @@ export function findBandCandidates(
   }
 
   // Pass two: gate each core and pad it out to a band. Growing the run outwards
-  // over faint rows was tried and made things worse (the band doubles in height
-  // and swallows the rule above); `bandPadFrac` already covers this.
+  // over faint rows was tried and made things worse.
   const candidates: BandCandidate[] = [];
   for (const core of cores) {
-    // Same two gates as the connected-component filter in the Python: the blob
-    // must be wide enough to be a line of print, and short enough not to be a
-    // block of handwriting or a dark region of the photo.
+    // Same gates as the connected-component filter in the Python: wide enough
+    // to be a line of print, short enough not to be handwriting or a dark patch.
     const lineHeight = core.bottom - core.top;
     if (
       lineHeight >= minHeight &&
@@ -251,19 +235,15 @@ export function findBandCandidates(
     .slice(0, config.maxCandidates);
 }
 
-// --- glyph boundaries ------------------------------------------------------
+// Glyph boundaries
 
 /**
  * Glyph boundaries, from fitting a fixed-pitch character grid.
  *
- * Gap-based merging cannot work on E-13B. The transit and on-us symbols are
- * drawn as several separate strokes, so any gap threshold loose enough to join
- * one symbol's strokes also joins two adjacent digits, and any threshold tight
- * enough to keep digits apart shatters the symbols.
- *
- * The font's constant pitch resolves it: estimate the pitch, fit a grid, and
- * let cell membership decide. Strokes of one symbol share a cell, adjacent
- * characters do not, and blank cells between fields hold no ink.
+ * Gap-based merging cannot work on E-13B: the transit and on-us symbols are
+ * drawn as separate strokes, so any threshold loose enough to join them also
+ * joins two adjacent digits. The font's constant pitch resolves it, letting
+ * cell membership decide instead.
  */
 export function findGlyphBoxes(
   mask: InkMask,
@@ -307,10 +287,9 @@ export function findGlyphBoxes(
     return kept;
   }
 
-  // Drop anything too wide to be one character. E-13B is fixed pitch, so a run
-  // spanning much more than a cell is a rule, a border or a dark patch. Catches
-  // a 182 px blob against a 16 px pitch, which would otherwise corrupt both the
-  // pitch estimate and the character it lands on.
+  // A run spanning much more than a cell is a rule, a border or a dark patch.
+  // Catches a 182 px blob against a 16 px pitch, which would otherwise corrupt
+  // the pitch estimate and the character it lands on.
   {
     const limit = stats.pitch * 1.4;
     const narrow = kept.filter(r => r.x1 - r.x0 <= limit);
@@ -323,18 +302,11 @@ export function findGlyphBoxes(
     }
   }
 
-  // Drop junk chains, keep the fields.
-  //
-  // Border rules, corner specks and edge micro-print sit apart from the band.
-  // Dropping anything with no near neighbour does not remove them, because they
-  // arrive in clusters that protect each other, so the split is done globally.
-  //
-  // Chains are judged on length, not distance. Keeping only the longest chain
-  // is wrong: the gap before the on-us field is a genuine field boundary that
-  // measured 2.21 pitches on a real cheque, so the account number split off and
-  // was discarded. Junk arrives in ones and twos; a MICR field never does. So
-  // every substantial chain is kept and rejoined, and only short chains at the
-  // ends are dropped. A short chain between two kept ones stays.
+  // Drop junk chains, keep the fields. Chains are judged on length, not
+  // distance: keeping only the longest is wrong, because the gap before the
+  // on-us field is a genuine boundary that measured 2.21 pitches on a real
+  // cheque, so the account number split off and was discarded. Junk arrives in
+  // ones and twos; a MICR field never does.
   if (kept.length >= 3) {
     const chains = splitIntoChains(kept, stats.pitch * config.maxNeighbourPitch);
     const substantial = chains.map(c => c.length >= MIN_CHAIN_GLYPHS);
@@ -377,18 +349,13 @@ export function findGlyphBoxes(
 }
 
 /**
- * Rejoin a character the grid cut in half.
+ * Rejoin a character the grid cut in half, which leaves the remainder correctly
+ * classified and the orphan a phantom character. This was the most common
+ * failure on real cheques.
  *
- * A cell boundary landing inside a multi-stroke symbol splits it. The on-us
- * symbol suffers most: two thin bars and a block, so a boundary after the first
- * bar leaves a 3 px orphan beside a 13 px remainder against a 17 px median. The
- * remainder still classifies as on-us and the orphan becomes a phantom
- * character. This was the most common failure on real cheques.
- *
- * Fixed pitch makes the repair safe: one character's ink cannot span more than
- * a cell, so two neighbours that together fit inside a pitch were never two
- * characters. At a 24 px pitch the halves of a split symbol sit 2 px apart and
- * span 18 px, while adjacent characters sit 6 px apart and span 36 px.
+ * Fixed pitch makes the repair safe: two neighbours that together fit inside a
+ * pitch were never two characters. At a 24 px pitch the halves of a split symbol
+ * span 18 px together, while adjacent characters span 36 px.
  */
 function mergeSplitGlyphs(boxes: GlyphBox[], pitch: number): GlyphBox[] {
   if (boxes.length < 2 || !isFinite(pitch) || pitch <= 1) {
@@ -419,11 +386,9 @@ interface PitchStats {
 }
 
 /**
- * Break a left-to-right list of runs wherever the gap exceeds `maxGap`.
- *
- * Gaps are measured between edges, not centres: two wide runs whose centres sit
- * far apart may still be touching, and it is the blank space between them that
- * says whether they belong to the same line of print.
+ * Break a left-to-right list of runs wherever the gap exceeds `maxGap`. Measured
+ * between edges, not centres, since two wide runs with distant centres may still
+ * be touching.
  */
 function splitIntoChains(runs: GlyphBox[], maxGap: number): GlyphBox[][] {
   const chains: GlyphBox[][] = [[runs[0]]];
@@ -438,11 +403,8 @@ function splitIntoChains(runs: GlyphBox[], maxGap: number): GlyphBox[][] {
 }
 
 /**
- * Typical run width, and the character pitch.
- *
- * The pitch is the median spacing between run centres, ignoring the short hops
- * between the strokes inside one symbol. With only a handful of multi-stroke
- * symbols in a 30-odd glyph line, the median still lands on a digit.
+ * Typical run width, and the character pitch: the median spacing between run
+ * centres, ignoring the short hops between strokes inside one symbol.
  */
 function estimatePitch(runs: GlyphBox[], config: SegmentConfig): PitchStats {
   const base = median(runs.map(r => r.x1 - r.x0));
@@ -458,15 +420,11 @@ function estimatePitch(runs: GlyphBox[], config: SegmentConfig): PitchStats {
 /**
  * Fit the character grid: both where it starts and how wide its cells are.
  *
- * DIVERGES: the training code refines only the origin and keeps the first pitch
- * estimate. That is fine over a handful of characters and wrong over thirty, as
- * a pitch out by 3% drifts nearly a whole cell across a MICR line. Once the grid
- * slips, characters at one end share a cell or split across two, giving a line
- * with the right number of boxes and the wrong contents.
- *
- * Instead: assign each run to its nearest cell, least-squares regress centre
- * against cell index for pitch (slope) and origin (intercept), and repeat.
- * Assignments stop moving after two or three rounds.
+ * DIVERGES: the training code refines only the origin, which is wrong over
+ * thirty characters, as a pitch out by 3% drifts nearly a whole cell and gives a
+ * line with the right number of boxes and the wrong contents. Instead, assign
+ * each run to its nearest cell, least-squares regress centre against cell index,
+ * and repeat until the assignments stop moving.
  */
 interface Grid {
   origin: number;
@@ -514,12 +472,9 @@ function fitGrid(centres: number[], pitch: number): Grid {
 }
 
 /**
- * How much does this look like a real MICR line rather than texture?
- *
- * Counting boxes alone rewards noise: an upside-down cheque once outscored the
- * right way up because a band of texture shattered into 70 fragments. A genuine
- * E-13B line has a bounded character count, widths that cluster within about 2x,
- * and centres on a constant pitch. All three are required.
+ * How much does this look like a real MICR line rather than texture? Counting
+ * boxes alone rewards noise, so a bounded character count, clustered widths and
+ * a constant pitch are all required.
  */
 export function bandQuality(
   boxes: GlyphBox[],
@@ -563,12 +518,9 @@ export function bandQuality(
 }
 
 /**
- * Spacing between consecutive glyphs, measured in character cells.
- *
- * E-13B is fixed pitch, so neighbouring characters are one cell apart and a
- * blank cell between fields reads as two. Anything larger is a hole where
- * characters should have been. This is the only evidence that the segmenter
- * dropped any, since the model cannot be unsure about a crop it never saw.
+ * Spacing between consecutive glyphs, in character cells. Neighbours are one
+ * cell apart and a blank cell between fields reads as two; anything larger is a
+ * hole where characters should have been.
  */
 export function cellSteps(boxes: GlyphBox[]): number[] {
   if (boxes.length < 2) {
@@ -586,17 +538,13 @@ export function cellSteps(boxes: GlyphBox[]): number[] {
   return deltas.map(d => Math.max(1, Math.round(d / pitch)));
 }
 
-// --- glyph crops -----------------------------------------------------------
+// Glyph crops
 
 /**
- * Cut one glyph to the model's input size.
- *
- * Full band height, never the glyph's own bounding box. The training renderer
- * places every glyph on one shared baseline at its true relative height, so the
- * dash is short within its crop. Cropping tight would rescale the dash to full
- * height and it would come back as a digit.
- *
- * Returns float32 in [0, 1]. Normalisation is a layer inside the model.
+ * Cut one glyph to the model's input size, at full band height and never the
+ * glyph's own bounding box. The training renderer puts every glyph on a shared
+ * baseline, so cropping tight would rescale the dash to full height and it would
+ * come back as a digit. Returns float32 in [0, 1].
  */
 export function cropGlyph(
   band: GrayImage,
@@ -622,7 +570,7 @@ export function cropGlyph(
   return out;
 }
 
-// --- driver ----------------------------------------------------------------
+// Driver
 
 export interface BandReading {
   band: GrayImage;
@@ -639,8 +587,7 @@ export interface BandReading {
 
 /**
  * Shortest chain of runs treated as part of the line rather than junk. The
- * auxiliary field is the shortest real field at six characters including its
- * delimiters; junk clusters seen so far run from one mark to five.
+ * auxiliary field is the shortest real field, at six characters.
  */
 const MIN_CHAIN_GLYPHS = 6;
 
@@ -649,15 +596,9 @@ const PLAUSIBLE_MIN_GLYPHS = 19;
 const PLAUSIBLE_MAX_GLYPHS = 40;
 
 /**
- * Order candidate bands so the likeliest MICR line is classified first.
- *
- * Segmentation quality alone is not enough: a block of clean sans headline text
- * segments into well-pitched, similar-width boxes and can outrank the real band.
- * Two cheap priors fix the ordering. The MICR line is the bottom-most line of
- * print on a cheque, and it runs about 19 to 40 characters.
- *
- * Neither is a filter. They only decide what is tried first; the ABA checksum
- * settles it a few steps later.
+ * Order candidate bands so the likeliest MICR line is classified first, using
+ * two cheap priors: the MICR line is the bottom-most print on a cheque, and it
+ * runs about 19 to 40 characters. Neither is a filter; the checksum settles it.
  */
 function rankBand(quality: number, boxes: number, centreFrac: number): number {
   const bottomness = 0.55 + 0.45 * clamp(centreFrac, 0, 1);
@@ -667,12 +608,9 @@ function rankBand(quality: number, boxes: number, centreFrac: number): number {
 }
 
 /**
- * Every plausible MICR band in a region, best-scoring first.
- *
- * Otsu suits an evenly-lit cheque and adaptive one lit from the side, and which
- * applies cannot be known in advance, so both are scored and the better wins.
- * Affordable because scoring involves no model: projections and a median, with
- * only the handful of survivors reaching the network.
+ * Every plausible MICR band in a region, best-scoring first. Both thresholds are
+ * scored and the better wins, which is affordable because scoring involves no
+ * model, only projections and a median.
  */
 export function readBands(
   region: GrayImage,
@@ -682,16 +620,13 @@ export function readBands(
 ): BandReading[] {
   const readings: BandReading[] = [];
 
-  // Locating the band is a coarse job (row sums over a smeared mask) and does
-  // not need full resolution, but cutting the strip does. So `region` can be a
-  // downscaled scout while `full` carries the pixels the crops come from, which
-  // keeps a 2400 px photo from being thresholded end to end repeatedly.
+  // Locating the band does not need full resolution, but cutting the strip
+  // does. `region` is a downscaled scout; `full` carries the crop pixels.
   const source = full ?? region;
   const scale = source.height / Math.max(1, region.height);
 
-  // Otsu locates a line of print; the adaptive pass exists for uneven lighting
-  // within the band. Running both over the whole photo was pure cost, so
-  // adaptive is only reached when Otsu turns up nothing at all.
+  // Adaptive exists for uneven lighting within the band. Running both over the
+  // whole photo was pure cost, so it is only reached when Otsu finds nothing.
   let candidates = findBandCandidates(region, inkMask(region, 'otsu'), config);
   if (candidates.length === 0 && modes.includes('adaptive')) {
     candidates = findBandCandidates(region, inkMask(region, 'adaptive'), config);
@@ -707,18 +642,16 @@ export function readBands(
     const centreFrac =
       (candidate.top + candidate.bottom) / 2 / Math.max(1, region.height);
 
-    // Both thresholds, on the strip alone. A band is a few hundred thousand
-    // pixels against the photo's several million, so binarising it two ways
-    // costs almost nothing.
+    // On the strip alone, which is a few hundred thousand pixels against the
+    // photo's several million.
     for (const mode of modes) {
       let band = raw;
       let mask = inkMask(raw, mode);
       let slope = 0;
       if (config.deskew) {
         slope = estimateShear(mask);
-        // Only re-threshold if the shear moved anything. On a guided capture
-        // the band is usually already level, and thresholding a strip twice for
-        // a slope of zero doubled the cost of the search.
+        // Only re-threshold if the shear moved anything; doing it for a slope
+        // of zero doubled the cost of the search.
         if (Math.abs(slope) > 1e-3) {
           band = shearVertical(raw, slope);
           mask = inkMask(band, mode);

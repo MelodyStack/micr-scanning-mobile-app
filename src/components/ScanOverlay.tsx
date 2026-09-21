@@ -1,17 +1,12 @@
 /**
  * Framing guide and status line.
  *
- * Two rules, both from testing against real cheques. Nothing is drawn over the
- * number line, since that is the part the user has to see to line it up; but
- * the guide still has to say where the numbers go, because removing the marker
- * entirely left people guessing. So the band is bracketed rather than covered,
- * with the row between the brackets left clear. White marks the cheque's edges,
- * red marks where the numbers belong.
+ * The band is bracketed rather than covered: nothing is drawn over the number
+ * line, since that is the part the user has to see to line it up. White marks
+ * the cheque's edges, red marks where the numbers belong.
  *
- * The outline is an aiming aid only. Recognition searches the whole photo and
- * finds the band itself, so no coordinate crosses between screen space and
- * sensor space. What the guide is for is getting the cheque close to filling
- * the frame, which decides how many pixels land on each glyph.
+ * An aiming aid only. Recognition searches the whole photo and finds the band
+ * itself, so no coordinate crosses between screen and sensor space.
  */
 
 import React from 'react';
@@ -68,15 +63,12 @@ function Corner({ style }: { style: object }) {
   return <View style={[styles.corner, style]} />;
 }
 
-// White for the sheet, red for the band. A cheque is cream paper with dark ink
-// and often a pastel security tint; green sat inside that range and disappeared
-// into it, which is why this is not green any more.
+// Green disappeared into the pastel security tint most cheques carry.
 const SHEET = '#ffffff';
 const BAND = '#ff3b30';
 
-// A MICR band sits in the bottom 5/8 inch of a 2.75 inch cheque, and the
-// characters themselves occupy roughly 84% to 91% of its height. The brackets
-// are set a little outside that so the row has room to breathe.
+// The band sits in the bottom 5/8 inch of a 2.75 inch cheque. The brackets sit
+// a little outside the characters so the row has room to breathe.
 const BAND_TOP = '79%';
 const BAND_BOTTOM = '4%';
 

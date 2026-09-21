@@ -1,15 +1,12 @@
 /**
  * Cheque photo to validated fields.
  *
- * The only ML step is classifying one 48x32 crop at a time. Everything either
- * side of it is ordinary code: find the band, cut the glyphs, join the
- * predictions, check the ABA digit. The checksum is a hard gate, so a bad read
- * is rejected rather than sent on.
+ * The only ML step is classifying one 48x32 crop at a time; everything either
+ * side of it is ordinary code. The checksum is a hard gate, so a bad read is
+ * rejected rather than sent on.
  *
- * Orientation is resolved by trying rather than guessing. Sensor mounting, EXIF
- * tags and `isMirrored` flags disagree across devices, so each rotation is
- * scored on how well it parses as E-13B (which costs no model calls) and only
- * the best one or two are classified.
+ * Orientation is resolved by trying rather than guessing, because sensor
+ * mounting, EXIF tags and `isMirrored` disagree across devices.
  */
 
 import type { TfliteModel } from 'react-native-fast-tflite';
@@ -122,12 +119,9 @@ export function describeModel(model: TfliteModel): string {
 }
 
 /**
- * Check the loaded model is the one this code was written against.
- *
- * `export/` contains float32, fp16 and int8 builds, and the app bundles one of
- * them under a name that does not say which. The wrong file, or a model
- * retrained with a different class order, produces confident nonsense that the
- * checksum rejects with no clue why.
+ * Check the loaded model is the one this code was written against. The wrong
+ * build, or one retrained with a different class order, produces confident
+ * nonsense that the checksum rejects with no clue why.
  */
 export function checkModelContract(model: TfliteModel): string | null {
   const input = model.inputs[0];
@@ -186,20 +180,13 @@ export function softmaxAll(logits: ArrayLike<number>): number[] {
 
 const SYMBOLS = new Set(['T', 'A', 'O', 'D']);
 
-/**
- * Confidence below which a symbol is worth reconsidering. The four E-13B
- * symbols are built from separate strokes, so a soft or tilted crop blurs them
- * into each other; they are what the model is least sure about.
- */
+/** Confidence below which a symbol is worth reconsidering. */
 const UNSURE = 0.9;
 
 /**
  * Probability a class needs before a glyph is worth reconsidering as that class.
- *
- * This keeps the transit repair honest. A line with one transit is missing one,
- * but trying every position means thirty attempts and the ABA checksum passes by
- * luck about one time in ten. Restricting it to positions the model itself
- * ranked as a possible transit collapses that to one or two candidates.
+ * Keeps the transit repair honest: trying every position would mean thirty
+ * attempts, and the ABA checksum passes by luck about one time in ten.
  */
 const MIN_ALTERNATIVE = 0.05;
 
@@ -238,17 +225,16 @@ export function recognizeCheque(
     return noBand('the framed area is too small to hold a MICR line');
   }
 
-  // Crop to the sheet first. Rotation-invariant, so it is done once and applied
-  // to all three levels by the same fractions, which keeps the scale factor
-  // between scout and work unchanged.
+  // Rotation-invariant, so done once and applied to all three levels by the
+  // same fractions, keeping the scout-to-work scale factor unchanged.
   const sheet = findSheet(pyramid.probe);
   const work = cropFraction(pyramid.work, sheet);
   const scout = cropFraction(pyramid.scout, sheet);
   const probe = cropFraction(pyramid.probe, sheet);
 
-  // Mirroring is not probed. A mirrored band segments exactly as well as an
-  // upright one, so no amount of geometry tells them apart; only classifying and
-  // checking the ABA digit does. That retry happens below, per candidate.
+  // Mirroring is not probed: a mirrored band segments exactly as well as an
+  // upright one, so only the checksum tells them apart. Retried per candidate
+  // below.
   const ranked = probeRotations
     .map(turns => ({
       turns,
@@ -256,9 +242,8 @@ export function recognizeCheque(
     }))
     .sort((a, b) => b.score - a.score);
 
-  // Keep any rotation close to the best, not just the winner. Geometry cannot
-  // separate a MICR line from a block of upside-down headline text, so pruning
-  // hard here would discard the right answer before the checksum saw it.
+  // Keep any rotation close to the best, since geometry cannot separate a MICR
+  // line from upside-down headline text.
   const viable = ranked.filter(r => r.score > 0);
   if (viable.length === 0) {
     return noBand('no line of print that looks like a MICR band');
@@ -266,15 +251,10 @@ export function recognizeCheque(
   const cutoff = viable[0].score * 0.4;
   const chosen = viable.filter(r => r.score >= cutoff).slice(0, keepRotations);
 
-  // Straighten each surviving rotation once, over the whole sheet.
-  //
-  // The band search groups rows of ink, and a skewed line of print is a tall
-  // smear rather than a short row: at 2 degrees across an 1800 px cheque the
-  // band climbs ~63 px, comparable to its own height, so it fails the
-  // maxBandHeightFrac test and is discarded. Deskewing per band cannot rescue
-  // that because there is no band left to deskew. Every line of print on a
-  // cheque shares the same skew, so the sheet-wide estimate has more to work
-  // with anyway.
+  // Straighten over the whole sheet, not per band. A skewed line is a tall
+  // smear rather than a short row (at 2 degrees across 1800 px the band climbs
+  // ~63 px) so it fails maxBandHeightFrac and is discarded before there is any
+  // band left to deskew.
   const levelled = chosen.map(({ turns }) => {
     let scouted = turns === 0 ? scout : rotate90(scout, turns);
     let full = turns === 0 ? work : rotate90(work, turns);
@@ -313,9 +293,8 @@ export function recognizeCheque(
       }
       bestFailure = better(bestFailure, uprightResult);
 
-      // A flipped sensor produces a band that segments and classifies perfectly
-      // then assembles backwards, failing the checksum with nothing to indicate
-      // why. Only tried after an upright read has already failed.
+      // A flipped sensor segments and classifies perfectly, then assembles
+      // backwards. Only tried after an upright read has failed.
       const flipped = mirrorImage(reading.band);
       const flippedBoxes = findGlyphBoxes(inkMask(flipped, reading.threshold), config);
       if (bandQuality(flippedBoxes, config) > 0) {
@@ -331,11 +310,9 @@ export function recognizeCheque(
     return null;
   };
 
-  // Otsu first, on its own: it is right for an evenly-lit cheque, which is most
-  // of them, and much the cheaper of the two. Adaptive is for a cheque lit from
-  // one side, where a single global threshold either loses the shaded end of the
-  // band or floods the lit end. Running both unconditionally roughly doubled the
-  // time for a photo Otsu alone already read correctly.
+  // Otsu suits most cheques and is the cheaper of the two; adaptive is for one
+  // lit from the side. Running both unconditionally roughly doubled the time for
+  // a photo Otsu alone already read correctly.
   return (
     attempt(['otsu']) ??
     attempt(['adaptive']) ??
@@ -356,11 +333,8 @@ function toPixels(region: Rect, image: GrayImage): Rect {
 /**
  * How well does this rotation parse as E-13B? No model calls, just geometry.
  *
- * Both threshold modes deliberately. `readBands` only reaches for adaptive when
- * Otsu finds no candidate at all, so this stays cheap on an ordinary cheque, but
- * passing Otsu alone made the probe blind to the images that need adaptive: on a
- * capture with glare, every rotation scored zero and the read gave up before the
- * adaptive path was tried.
+ * Both threshold modes deliberately: Otsu alone made the probe blind to the
+ * glare-lit images that need adaptive, scoring every rotation zero.
  */
 function bestQuality(image: GrayImage, config: SegmentConfig): number {
   return readBands(image, config, ['otsu', 'adaptive'])[0]?.rank ?? 0;
@@ -372,11 +346,7 @@ function record(seen: string[], raw: string): void {
   }
 }
 
-/**
- * Prefer the failure that got furthest. A read that assembled 32 glyphs and
- * missed the checksum by one digit is more useful to show than one that found
- * four smudges.
- */
+/** Prefer the failure that got furthest, which makes a better hint. */
 function better(current: Recognition | null, candidate: Recognition): Recognition {
   if (!current) {
     return candidate;
@@ -399,14 +369,10 @@ interface BandClassification {
 /**
  * Did the segmenter drop characters out of the middle of a number?
  *
- * The rest of the pipeline cannot see this. The ABA checksum only covers the
- * routing number, and confidence says nothing: the model answers the crops it is
- * given correctly, so a read missing two account digits came back at 0.93
- * minimum confidence.
- *
- * Fixed pitch supplies the missing evidence. Adjacent characters are one cell
- * apart and a blank cell between fields makes two, so a gap between two *digits*
- * is a hole where characters used to be.
+ * Nothing else can see this: the checksum covers only the routing number, and
+ * the model answers the crops it is given correctly, so a read missing two
+ * account digits still scored 0.93. Fixed pitch supplies the evidence, since a
+ * gap between two digits is a hole where characters used to be.
  */
 export function hasMissingDigits(raw: string, steps: number[]): boolean {
   for (let i = 0; i + 1 < raw.length && i < steps.length; i++) {
@@ -433,9 +399,8 @@ function classifyBand(
 
   boxes.forEach((box, position) => {
     const input = cropGlyph(band, box, config);
-    // runSync takes and returns raw ArrayBuffers. The model wants
-    // [1, 48, 32, 1] NHWC float32 in 0..1; normalisation is a layer inside the
-    // model, so the crop goes straight across with no mean/std applied here.
+    // Normalisation is a layer inside the model, so the crop goes straight
+    // across with no mean/std applied here.
     const [logits] = model.runSync([input.buffer as ArrayBuffer]);
     const probabilities = softmaxAll(new Float32Array(logits));
 
@@ -449,9 +414,8 @@ function classifyBand(
     classes.push(classAt(best));
     confidences.push(probabilities[best]);
 
-    // Note the runner-up while the probabilities are to hand. Symbol for symbol
-    // only, and only where the model was unsure: digits are never reconsidered,
-    // so the routing and account numbers are exactly as read.
+    // Symbol for symbol only: digits are never reconsidered, so the routing
+    // and account numbers stay exactly as read.
     if (SYMBOLS.has(label) && probabilities[best] < UNSURE) {
       let alternative = -1;
       for (let i = 0; i < probabilities.length; i++) {
@@ -467,9 +431,8 @@ function classifyBand(
       }
     }
 
-    // Separately, note anywhere the model gave transit a real chance, digits
-    // included. The transit pair is mandatory, so a line carrying one has lost
-    // one, and these are the only places worth looking.
+    // Anywhere the model gave transit a real chance, digits included. The
+    // transit pair is mandatory, so a line carrying one has lost one.
     if (
       label !== 'T' &&
       transitIndex >= 0 &&
@@ -491,17 +454,11 @@ function classifyBand(
 }
 
 /**
- * Retry a failed read with a few leading characters discarded.
+ * Retry a failed read with a few leading characters discarded, for when the band
+ * search picks up print to the left of the line.
  *
- * Cheques carry print to the left of the band (vertical micro-text, border
- * rules, specks) and the band search keeps it when it falls within a couple of
- * pitches of the first character. The result is a line that is right with junk
- * on the front.
- *
- * Only the leading side is trimmed. The trailing side holds the account number,
- * so dropping characters there would quietly shorten it; the leading side holds
- * the auxiliary cheque number, which has to match `O<digits>O` exactly for the
- * trimmed string to parse at all.
+ * Leading side only. The trailing side holds the account number, so trimming
+ * there would quietly shorten it.
  */
 const MAX_LEADING_TRIM = 3;
 
@@ -527,13 +484,10 @@ function parseAllowingLeadingJunk(
 const MAX_SHORTLIST = 12;
 
 /**
- * Retry with an unsure symbol replaced by the model's second choice.
- *
- * The symbols delimit the fields, so one wrong symbol invalidates an otherwise
- * perfect read. Only symbols are reconsidered: digits stay exactly as
- * classified, and a swap still has to satisfy the ABA checksum, the field
- * structure and the missing-digit check before it is accepted. The runner-up
- * came out of the same softmax as the winner, so trying costs nothing.
+ * Retry with an unsure symbol replaced by the model's second choice. The symbols
+ * delimit the fields, so one wrong symbol invalidates an otherwise perfect read.
+ * A swap still has to satisfy the checksum, the field structure and the
+ * missing-digit check.
  */
 function repairSymbols(
   raw: string,
@@ -551,12 +505,10 @@ function repairSymbols(
       : null;
   };
 
-  // Structural candidates on top of the confidence-based ones. Exactly two
-  // transits delimit the routing number, so a line carrying one has lost a
-  // transit. Confidence does not help here: on a tilted capture the wrong
-  // reading scored above 0.90, so a threshold that caught it would have
-  // reconsidered half the line. Promotion is not trusted on its own, as the nine
-  // characters it exposes still have to be digits and satisfy the checksum.
+  // Confidence does not help here: on a tilted capture the wrong reading scored
+  // above 0.90, so a threshold that caught it would have reconsidered half the
+  // line. The nine characters a promotion exposes still have to satisfy the
+  // checksum.
   const structural: { index: number; to: string }[] = [];
   if ((raw.match(/T/g) ?? []).length === 1) {
     for (const candidate of transitCandidates.slice(0, 4)) {
@@ -638,8 +590,6 @@ function finish(
 
 /**
  * Confidence below which a read is flagged even though it passed the checksum.
- * A random misread has roughly a 1-in-10 chance of passing the ABA check by
- * luck, and requiring two transits in plausible positions narrows that a long
- * way further but not to zero.
+ * A random misread passes the ABA check by luck roughly one time in ten.
  */
 export const LOW_CONFIDENCE = 0.75;

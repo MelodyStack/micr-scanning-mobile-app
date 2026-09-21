@@ -1,21 +1,13 @@
 /**
- * JPEG on disk -> grayscale pixels in memory.
+ * JPEG on disk to grayscale pixels in memory.
  *
- * This is the only module in the pipeline that touches a native library.
- * Everything downstream is plain TypeScript over a Uint8Array, which is what
- * lets the segmenter and the parser be unit-tested without a device.
+ * The only module in the pipeline that touches a native library; everything
+ * downstream is plain TypeScript over a Uint8Array, which is what lets the
+ * segmenter and parser be unit-tested without a device.
  *
- * Skia is used rather than a frame processor for two reasons:
- *
- *  1. A still photo is 4032x3024 on the phones this targets. Across a cheque
- *     that is roughly 90 px per MICR glyph. The previous frame-processor design
- *     worked from a 960 px video frame, about 30 px per glyph, and then
- *     upscaled each one to the model's 32x48 input. The model was trained on
- *     crops cut from full-resolution photos, so that gap alone would cost
- *     accuracy no amount of tuning could recover.
- *
- *  2. Surface.Make() is a CPU raster surface. It needs no GL context, which
- *     matters on the emulator, where the GL stack is unreliable.
+ * Skia rather than a frame processor: a still gives ~90 px per MICR glyph
+ * against ~30 from a video frame, and Surface.Make() is a CPU raster surface
+ * needing no GL context, which matters on emulators.
  */
 
 import {
@@ -40,12 +32,9 @@ export function toUri(path: string): string {
 }
 
 /**
- * Decode once and emit all three working resolutions.
- *
- * Scaling is what a read spends much of its time on, and Skia does it in native
- * code, so the alternative of decoding at full size and rescaling twice in
- * JavaScript, pays for the same work in a bytecode interpreter. One decode,
- * three native draws.
+ * Decode once and emit all three working resolutions: one decode, three native
+ * draws. Rescaling in JavaScript instead would pay for the same work in a
+ * bytecode interpreter.
  */
 export async function decodePyramid(
   pathOrUri: string,
@@ -130,11 +119,9 @@ export function imageToGrayscale(image: SkImage, maxSide: number): GrayImage {
 }
 
 /**
- * RGBA -> luminance, ITU-R BT.601 weights in fixed point.
- *
- * The green weight dominating is not incidental here: cheque security tints are
- * usually blue or green pastels, and weighting green heavily flattens a blue
- * tint into the paper rather than letting it read as ink.
+ * RGBA to luminance, ITU-R BT.601 weights in fixed point. The dominant green
+ * weight helps here: cheque security tints are usually blue or green pastels,
+ * and this flattens a blue tint into the paper rather than reading it as ink.
  */
 export function toLuminance(rgba: Uint8Array, width: number, height: number): GrayImage {
   const out = new Uint8Array(width * height);
