@@ -9,7 +9,7 @@
  *
  *  1. A still photo is 4032x3024 on the phones this targets. Across a cheque
  *     that is roughly 90 px per MICR glyph. The previous frame-processor design
- *     worked from a 960 px video frame -- about 30 px per glyph -- and then
+ *     worked from a 960 px video frame, about 30 px per glyph, and then
  *     upscaled each one to the model's 32x48 input. The model was trained on
  *     crops cut from full-resolution photos, so that gap alone would cost
  *     accuracy no amount of tuning could recover.
@@ -31,7 +31,7 @@ import { type GrayImage, type ImagePyramid, PYRAMID_SIZES } from './image';
 
 export class DecodeError extends Error {}
 
-/** Prefix a bare filesystem path with file:// -- Skia needs a URI. */
+/** Prefix a bare filesystem path with file://, which Skia requires. */
 export function toUri(path: string): string {
   if (/^[a-z][a-z0-9+.-]*:/i.test(path)) {
     return path;
@@ -43,7 +43,7 @@ export function toUri(path: string): string {
  * Decode once and emit all three working resolutions.
  *
  * Scaling is what a read spends much of its time on, and Skia does it in native
- * code -- so the alternative, decoding at full size and rescaling twice in
+ * code, so the alternative of decoding at full size and rescaling twice in
  * JavaScript, pays for the same work in a bytecode interpreter. One decode,
  * three native draws.
  */
@@ -66,7 +66,7 @@ async function withDecoded<T>(
   const image = Skia.Image.MakeImageFromEncoded(data);
   if (!image) {
     data.dispose?.();
-    throw new DecodeError(`could not decode ${pathOrUri} -- unsupported or corrupt image`);
+    throw new DecodeError(`could not decode ${pathOrUri}: unsupported or corrupt image`);
   }
   try {
     return read(image);
@@ -139,7 +139,8 @@ export function imageToGrayscale(image: SkImage, maxSide: number): GrayImage {
 export function toLuminance(rgba: Uint8Array, width: number, height: number): GrayImage {
   const out = new Uint8Array(width * height);
   for (let i = 0, p = 0; i < out.length; i++, p += 4) {
-    // eslint-disable-next-line no-bitwise -- fixed point: /256 without a divide
+    // Fixed point: >> 8 divides by 256 without a divide instruction.
+    // eslint-disable-next-line no-bitwise
     out[i] = (rgba[p] * 77 + rgba[p + 1] * 150 + rgba[p + 2] * 29) >> 8;
   }
   return { data: out, width, height };

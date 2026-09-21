@@ -1,25 +1,17 @@
 /**
  * Framing guide and status line.
  *
- * Two rules, both learned from testing against real cheques:
+ * Two rules, both from testing against real cheques. Nothing is drawn over the
+ * number line, since that is the part the user has to see to line it up; but
+ * the guide still has to say where the numbers go, because removing the marker
+ * entirely left people guessing. So the band is bracketed rather than covered,
+ * with the row between the brackets left clear. White marks the cheque's edges,
+ * red marks where the numbers belong.
  *
- *  1. **Nothing is drawn over the number line.** An early version put a dashed
- *     box and the caption "NUMBER LINE" exactly where the MICR band falls --
- *     the one part of the cheque the user has to see to line it up.
- *  2. **But it still has to say where the numbers go.** Removing the marker
- *     entirely left the user guessing.
- *
- * So the band is *bracketed*, never covered: a red line above it and another
- * below, with the row between them left completely clear. White marks the
- * cheque's edges, red means "put the numbers here" -- two colours, one job
- * each.
- *
- * The outline is an aiming aid, nothing more. Recognition searches the whole
- * photo and finds the band itself, so no coordinate ever crosses between screen
- * space and sensor space -- which is where an earlier version of this app spent
- * most of its bugs. What the guide is genuinely for is getting the cheque close
- * to filling the frame, because that decides how many pixels land on each
- * glyph.
+ * The outline is an aiming aid only. Recognition searches the whole photo and
+ * finds the band itself, so no coordinate crosses between screen space and
+ * sensor space. What the guide is for is getting the cheque close to filling
+ * the frame, which decides how many pixels land on each glyph.
  */
 
 import React from 'react';
@@ -41,7 +33,7 @@ export default function ScanOverlay({ note, busy, warn }: Props) {
         </Text>
         {warn ? (
           <Text style={styles.warn}>
-            One character was borderline — check the digits carefully.
+            One character was borderline. Check the digits carefully.
           </Text>
         ) : (
           <Text style={styles.sub}>

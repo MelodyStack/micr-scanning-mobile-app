@@ -10,7 +10,7 @@
  *  * Frame processors on VisionCamera v4 require react-native-worklets-core,
  *    which has no build for this React Native version. It fails to link
  *    `__cxa_init_primary_exception` and takes the process down during
- *    TurboModule init -- before any JavaScript runs at all.
+ *    TurboModule init, before any JavaScript runs at all.
  *
  * So there are no worklets anywhere in this app. Capture is a promise, decoding
  * is Skia, and recognition is ordinary TypeScript on the JS thread.
@@ -53,8 +53,8 @@ import ScanOverlay from '../components/ScanOverlay';
  * `micr_cnn_v1.tflite` name, so nothing on disk said which was shipping and
  * copying the fp32 export over it would have silently swapped models. The int8
  * build measures 99.67% argmax parity against PyTorch versus 100% for float32,
- * and the difference costs 350 KB of APK -- not a trade worth making when the
- * whole design leans on reads being right.
+ * and the difference costs 350 KB of APK, which is not a trade worth making
+ * when the whole design leans on reads being right.
  */
 const MODEL = require('../../assets/micr_cnn_v1_fp32.tflite');
 
@@ -80,9 +80,9 @@ export default function ScanScreen() {
   // one the segmenter does not have to invent.
   const format = useCameraFormat(device, [{ photoResolution: 'max' }]);
   // The camera LED. Lighting is the biggest lever on whether a band segments
-  // cleanly, so it earns its place on real hardware -- but emulators have no
-  // LED, and asking CameraX for a flash that does not exist throws
-  // FlashUnavailableError straight out of takePhoto.
+  // cleanly, so it earns its place on real hardware. Emulators have no LED, and
+  // asking CameraX for a flash that does not exist throws FlashUnavailableError
+  // straight out of takePhoto.
   const hasTorch = device?.hasTorch ?? false;
 
   const camera = useRef<Camera>(null);
@@ -211,9 +211,9 @@ export default function ScanScreen() {
    *
    * But CameraX finishes every photo by writing EXIF orientation back into the
    * file, and `ExifInterface` rejects anything it cannot parse as JPEG/PNG/WebP.
-   * Emulators with a virtual camera -- LDPlayer among them -- produce exactly
-   * that, so the capture succeeds, the bytes reach disk, and then the whole
-   * thing is thrown away over a metadata write:
+   * Emulators with a virtual camera, LDPlayer among them, produce exactly that:
+   * the capture succeeds, the bytes reach disk, and the whole thing is thrown
+   * away over a metadata write.
    *
    *   androidx.camera.core.ImageCaptureException: Failed to update Exif data
    *   Caused by: java.io.IOException: ExifInterface only supports saving
@@ -221,8 +221,8 @@ export default function ScanScreen() {
    *
    * `takeSnapshot` grabs the preview view's bitmap and compresses it itself, so
    * it never goes near ExifInterface. It is limited to the size of the preview
-   * on screen, which is a real loss of resolution -- hence second choice, not
-   * first -- but it is the difference between a usable scanner and a dead
+   * on screen, which is a real loss of resolution, hence second choice rather
+   * than first. It is still the difference between a usable scanner and a dead
    * button on a virtual device.
    */
   const capture = useCallback(async () => {
@@ -317,21 +317,19 @@ export default function ScanScreen() {
           enableZoomGesture={false}
         />
       ) : (
-        // No camera is the emulator's normal state. The test image is the whole
-        // point of this branch: the pipeline stays exercisable without one.
+        // No usable camera, which is the emulator's normal state.
         <Centered>
           <Text style={styles.title}>No camera on this device</Text>
           <Text style={styles.body}>
-            Use the bundled test cheque to check the reader end to end.
+            The scanner needs a rear camera to capture a cheque.
           </Text>
         </Centered>
       )}
 
-      {/* Overlay and controls are laid out as a column above the camera, so
-          the guide is centred in whatever space is left between the header and
-          the control bar. Floating the controls over the preview put the torch
-          and the shutter on top of both ends of the MICR band -- the one part
-          of the cheque the user has to be able to see. */}
+      {/* Overlay and controls are a column above the camera, so the guide is
+          centred in whatever space is left between the header and the control
+          bar. Floating the controls over the preview put the torch and the
+          shutter on top of both ends of the MICR band. */}
       <View style={styles.stack} pointerEvents="box-none">
         <View style={styles.overlaySlot} pointerEvents="none">
           <ScanOverlay

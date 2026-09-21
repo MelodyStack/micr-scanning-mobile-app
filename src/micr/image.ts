@@ -130,7 +130,7 @@ interface Taps {
  *
  * Downscaling averages over the whole source interval, which is what
  * cv2.INTER_AREA does and what the training crops went through. Upscaling falls
- * back to bilinear -- INTER_AREA degenerates to nearest-neighbour there, and
+ * back to bilinear, since INTER_AREA degenerates to nearest-neighbour there and
  * bilinear is the better behaviour for a crop that happens to be smaller than
  * the model input.
  */
@@ -289,7 +289,7 @@ export interface ImagePyramid {
  *
  * At `work` = 1800 a 6.14 inch cheque is ~293 px/inch, so E-13B's 8 characters
  * per inch land on a 37 px pitch and the padded band is ~85 px tall. Every
- * glyph crop is therefore a downscale to 32x48 -- the same direction the
+ * glyph crop is therefore a downscale to 32x48, the same direction the
  * training crops were resampled in, which is the property that matters. Going
  * higher only buys pixels the model throws away, and every stage of the search
  * scales with them: at 2400 a read took 7.0 s on device.
@@ -382,7 +382,7 @@ export type ThresholdMode = 'otsu' | 'adaptive';
  * Ink mask. Ink is dark, so a pixel is ink when it sits below the threshold.
  *
  * `adaptive` approximates cv2.ADAPTIVE_THRESH_GAUSSIAN_C with a box mean over
- * an integral image -- O(n) regardless of window size, and the difference from
+ * an integral image: O(n) regardless of window size. The difference from
  * a true Gaussian window is immaterial at the block sizes used here. It is what
  * rescues a cheque photographed under a side light, where one global threshold
  * either loses the shaded end of the band or floods the lit end.
@@ -413,7 +413,7 @@ export function inkMask(
   // Int32, not Float64. The largest possible sum is width * height * 255, which
   // for any image this pipeline handles stays well inside a signed 32-bit int,
   // and halving the width of the table halves the memory traffic of the four
-  // lookups per pixel below -- which is what this function actually spends its
+  // lookups per pixel below, which is what this function actually spends its
   // time on.
   const src = blurred.data;
   const stride = width + 1;
@@ -528,7 +528,7 @@ export function closeHorizontal(mask: InkMask, kernel: number): InkMask {
  * classic projection-profile method instead: shear the ink by a candidate
  * slope, and score how tightly it piles into a few rows. It is more stable than
  * minAreaRect on a band that has picked up a fragment of the cheque border,
- * which is the case minAreaRect handles worst -- the training code guards that
+ * which is the case minAreaRect handles worst. The training code guards that
  * with a +/-12 degree sanity clamp for exactly this reason.
  */
 export function estimateShear(mask: InkMask, maxSlope?: number, steps = 21): number {
@@ -540,7 +540,7 @@ export function estimateShear(mask: InkMask, maxSlope?: number, steps = 21): num
   // A shear moves the outermost column by slope * width/2. Allowing more than
   // the strip can physically hold just slides the text out of its own crop, so
   // the limit is set by the aspect ratio. A 46 px band across 1600 px tolerates
-  // barely 1.6 degrees before the line leaves the band at one end -- and a
+  // barely 1.6 degrees before the line leaves the band at one end, and a
   // cheque skewed further than that would not have produced a clean, short row
   // of ink for the band finder to latch onto in the first place.
   const geometric = (0.6 * height) / width;
@@ -553,7 +553,7 @@ export function estimateShear(mask: InkMask, maxSlope?: number, steps = 21): num
 
   // Gather the ink once rather than re-walking every pixel for all 21 slopes.
   // Ink is a few percent of a cheque, so this turns the search from tens of
-  // millions of iterations into tens of thousands -- it was the single most
+  // millions of iterations into tens of thousands. It was the single most
   // expensive thing in a read.
   let inkCount = 0;
   for (let i = 0; i < data.length; i++) {
@@ -589,7 +589,7 @@ export function estimateShear(mask: InkMask, maxSlope?: number, steps = 21): num
       const target = Math.round(ys[i] - slope * (xs[i] - centreX));
       // Discard what shears out of the strip. Clamping instead piles every
       // out-of-range pixel onto the first and last rows, which manufactures two
-      // huge spikes -- so the most extreme slope always won, and every band
+      // huge spikes, so the most extreme slope always won and every band
       // came back sheared to the limit and unreadable.
       if (target < 0 || target >= height) {
         continue;
@@ -654,7 +654,8 @@ export function median(values: ArrayLike<number>): number {
     return 0;
   }
   const sorted = Array.from(values).sort((a, b) => a - b);
-  // eslint-disable-next-line no-bitwise -- integer halving
+  // Integer halving.
+  // eslint-disable-next-line no-bitwise
   const mid = sorted.length >> 1;
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }

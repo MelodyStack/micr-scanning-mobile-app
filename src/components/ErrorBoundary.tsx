@@ -1,7 +1,7 @@
 /**
  * Catches render-time errors so a bug shows a readable message instead of a
  * blank screen. Native crashes (TFLite, the camera) still take the process
- * down -- those only show up in `adb logcat`.
+ * down, which otherwise only shows up in `adb logcat`.
  */
 
 import React from 'react';

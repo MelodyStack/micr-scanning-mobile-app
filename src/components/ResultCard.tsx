@@ -30,13 +30,13 @@ export default function ResultCard({
     <View style={styles.sheet}>
       <View style={[styles.badge, lowConfidence && styles.badgeWarn]}>
         <Text style={[styles.badgeText, lowConfidence && styles.badgeTextWarn]}>
-          {lowConfidence ? 'Checksum passed — low confidence' : 'Checksum passed'}
+          {lowConfidence ? 'Checksum passed, low confidence' : 'Checksum passed'}
         </Text>
       </View>
 
       <Row label="Routing" value={fields.routing_number} />
       <Row label="Account" value={fields.account_number} />
-      <Row label="Cheque no." value={fields.check_number ?? '—'} />
+      <Row label="Cheque no." value={fields.check_number ?? 'none'} />
       {fields.amount_field && <Row label="Amount field" value={fields.amount_field} />}
 
       <Text style={styles.verify}>Check these against the cheque before continuing.</Text>

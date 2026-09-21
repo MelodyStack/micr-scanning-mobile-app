@@ -24,7 +24,7 @@ import {
 import {
   hasMissingDigits,
   recognizeCheque,
-  softmaxPeak,
+  softmaxAll,
 } from '../src/micr/recognize';
 
 // --- fixture ---------------------------------------------------------------
@@ -125,7 +125,7 @@ describe('parseMicr', () => {
 
   it('handles a personal layout with the cheque number after the on-us', () => {
     // chk005: no aux field, cheque number trails. This is the trap in spec
-    // section 8 -- get it wrong and the account number absorbs the cheque
+    // section 8: get it wrong and the account number absorbs the cheque
     // number.
     const result = parseMicr('T111000614T 687808910O8241');
     expect(result.ok).toBe(true);
@@ -510,7 +510,7 @@ describe('finding the band in a whole cheque', () => {
 /**
  * A model that returns the right answer for a correctly ordered band.
  *
- * It cannot tell us whether the CNN is accurate -- only real crops do that --
+ * It cannot tell us whether the CNN is accurate, which only real crops do,
  * but it does test everything around the CNN: that boxes come out left to
  * right, that the symbol substitution is applied, that a mirrored band is
  * retried, and that the checksum is what decides.
@@ -589,7 +589,7 @@ describe('missing-digit detection', () => {
 
   /**
    * steps[i] is the distance from raw[i] to raw[i+1] in cells: 1 unless listed.
-   * Written this way on purpose -- hand-counting a 30-entry array got the
+   * Written this way on purpose, because hand-counting a 30-entry array got the
    * alignment wrong twice, and one of those still passed, for the wrong reason.
    */
   const stepsFor = (length: number, wider: Record<number, number>): number[] =>
@@ -617,7 +617,7 @@ describe('symbol repair', () => {
 
   it('recovers a transit misread as a dash', () => {
     // A real tilted capture. Every character is right except the first transit,
-    // which came back as a dash -- at over 0.90 confidence, so no confidence
+    // which came back as a dash at over 0.90 confidence, so no confidence
     // threshold would have caught it. Structure does: a MICR line carries
     // exactly two transit symbols, and the promoted reading still has to
     // satisfy the ABA checksum on the nine digits it exposes.
@@ -634,7 +634,7 @@ describe('symbol repair', () => {
   it('will not promote a symbol into a routing number that fails the checksum', () => {
     // The same shape, one routing digit different. Promoting the dash here
     // yields a structurally valid line whose checksum does not hold, so it has
-    // to stay rejected -- this is what keeps the repair from inventing reads.
+    // to stay rejected. This is what keeps the repair from inventing reads.
     expect(parseMicr('O00279106OT062206294T5500272066O').ok).toBe(false);
   });
 });
@@ -642,7 +642,7 @@ describe('symbol repair', () => {
 describe('field gaps', () => {
   // A MICR line is not evenly spaced. The gap between the transit field and the
   // on-us field runs wider than the character pitch, and an earlier version
-  // treated any gap over 2 pitches as the end of the line -- so it kept the
+  // treated any gap over 2 pitches as the end of the line, so it kept the
   // longest run of glyphs and threw the rest away. On a real capture that meant
   // silently discarding the entire account field.
 
@@ -678,7 +678,7 @@ describe('field gaps', () => {
 
   it('keeps both fields across a gap wider than the neighbour threshold', () => {
     // 2.21 pitches is what the failing capture actually measured ahead of its
-    // account field -- above the 2.0 neighbour threshold, and entirely legitimate.
+    // account field: above the 2.0 neighbour threshold, and entirely legitimate.
     const band = twoFields(18, 11, 2.21);
     const boxes = findGlyphBoxes(inkMask(band, 'otsu'), DEFAULT_CONFIG);
     expect(boxes).toHaveLength(29);
@@ -702,8 +702,8 @@ describe('truncated lines', () => {
 
   it('rejects an account field left open by a cut line', () => {
     // chk007, segmented to 25 of its 28 glyphs. Checksum-valid, structurally
-    // clean, and wrong by two digits -- it read as a 7-digit account where the
-    // truth is 9. The tell is the missing on-us symbol: the field never closed.
+    // clean, and wrong by two digits: a 7-digit account where the truth is 9.
+    // The missing on-us symbol is the giveaway, as the field never closed.
     const truth = 'O40458OT000000518T572859650O';
     const cut = 'O40458OT000000518T5728596';
 
@@ -732,15 +732,15 @@ describe('truncated lines', () => {
 });
 
 describe('softmax', () => {
-  it('returns the peak class and a probability in (0, 1]', () => {
-    const { index, p } = softmaxPeak([0, 0, 5, 0]);
-    expect(index).toBe(2);
-    expect(p).toBeGreaterThan(0.9);
-    expect(p).toBeLessThanOrEqual(1);
+  it('peaks on the largest logit and sums to one', () => {
+    const p = softmaxAll([0, 0, 5, 0]);
+    expect(p.indexOf(Math.max(...p))).toBe(2);
+    expect(p[2]).toBeGreaterThan(0.9);
+    expect(p.reduce((a: number, b: number) => a + b, 0)).toBeCloseTo(1, 6);
   });
 
   it('is near chance when every logit is equal', () => {
-    const { p } = softmaxPeak(new Array(14).fill(1));
-    expect(p).toBeCloseTo(1 / 14, 5);
+    const p = softmaxAll(new Array(14).fill(1));
+    expect(p[0]).toBeCloseTo(1 / 14, 5);
   });
 });
